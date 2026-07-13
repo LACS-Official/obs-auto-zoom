@@ -1,12 +1,16 @@
+-- OBS Auto Zoom
+-- Copyright (c) 领创工作室.  All rights reserved.
+
 --
 -- OBS Zoom to Mouse
 -- An OBS lua script to zoom a display-capture source to focus on the mouse.
 -- Copyright (c) BlankSourceCode.  All rights reserved.
 --
 
+
 local obs = obslua
 local ffi = require("ffi")
-local VERSION = "1.0.2"
+local VERSION = "1.0.1"
 local CROP_FILTER_NAME = "obs-zoom-to-mouse-crop"
 
 local socket_available, socket = pcall(require, "ljsocket")
