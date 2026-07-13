@@ -40,6 +40,28 @@ local hotkey_zoom_id = nil
 local hotkey_follow_id = nil
 local is_timer_running = false
 
+-- Physics and custom controls
+local spring_strength = 0.0
+local damping_ratio = 0.6
+local cam_vel_x = 0.0
+local cam_vel_y = 0.0
+local last_timer_time = 0.0
+local is_zoom_locked = false
+local locked_crop_pos = { x = 0, y = 0 }
+local zoom_step = 0.5
+local hotkey_lock_id = nil
+local hotkey_zoom_in_id = nil
+local hotkey_zoom_out_id = nil
+local script_settings = nil
+
+-- Auto reset zoom on idle variables
+local use_auto_reset_zoom = false
+local auto_reset_zoom_delay = 3.0
+local idle_time = 0.0
+local last_mouse_pos = { x = 0, y = 0 }
+local target_zoom_factor = 1.0
+local zoom_curve = "ease_in_out"
+
 local win_point = nil
 local x11_display = nil
 local x11_root = nil
@@ -273,16 +295,29 @@ function lerp(v0, v1, t)
 end
 
 ---
--- Ease a time value in and out
+-- Get the ease progress value based on curve type and current time t
+---@param curve_type string The name of easing curve
 ---@param t number Time between 0 and 1
----@return number
-function ease_in_out(t)
-    t = t * 2
-    if t < 1 then
-        return 0.5 * t * t * t
-    else
-        t = t - 2
-        return 0.5 * (t * t * t + 2)
+---@return number value Ease progress
+function get_ease_value(curve_type, t)
+    if curve_type == "linear" then
+        return t
+    elseif curve_type == "ease_in" then
+        return t * t * t
+    elseif curve_type == "ease_out" then
+        return 1 - (1 - t) * (1 - t) * (1 - t)
+    elseif curve_type == "overshoot" then
+        local s = 1.70158
+        local t_norm = t - 1
+        return t_norm * t_norm * ((s + 1) * t_norm + s) + 1
+    else -- "ease_in_out"
+        t = t * 2
+        if t < 1 then
+            return 0.5 * t * t * t
+        else
+            t = t - 2
+            return 0.5 * (t * t * t + 2)
+        end
     end
 end
 
@@ -784,8 +819,8 @@ function get_target_position(zoom)
     -- Remember that because we are using a crop/pad filter making the size smaller (dividing by zoom) means that we see less of the image
     -- in the same amount of space making it look bigger (aka zoomed in)
     local new_size = {
-        width = zoom.source_size.width / zoom.zoom_to,
-        height = zoom.source_size.height / zoom.zoom_to
+        width = zoom.source_size.width / target_zoom_factor,
+        height = zoom.source_size.height / target_zoom_factor
     }
 
     -- New offset for the crop/pad filter is whereever we clicked minus half the size, so that the clicked point because the new center
@@ -807,6 +842,49 @@ function get_target_position(zoom)
     crop.y = math.floor(clamp(0, (zoom.source_size.height - new_size.height), crop.y))
 
     return { crop = crop, raw_center = mouse, clamped_center = { x = math.floor(crop.x + crop.w * 0.5), y = math.floor(crop.y + crop.h * 0.5) } }
+end
+
+function on_toggle_lock(pressed)
+    if pressed then
+        if zoom_state == ZoomState.ZoomedIn then
+            is_zoom_locked = not is_zoom_locked
+            log("Camera focus lock is " .. (is_zoom_locked and "on" or "off"))
+            if is_zoom_locked then
+                locked_crop_pos = { x = crop_filter_info.x, y = crop_filter_info.y }
+                cam_vel_x = 0
+                cam_vel_y = 0
+            end
+        end
+    end
+end
+
+function update_zoom_value(new_zoom)
+    if new_zoom < 1.0 then new_zoom = 1.0 end
+    if new_zoom > 5.0 then new_zoom = 5.0 end
+    if zoom_value ~= new_zoom then
+        zoom_value = new_zoom
+        log("Zoom factor adjusted to: " .. zoom_value)
+        if script_settings ~= nil then
+            obs.obs_data_set_double(script_settings, "zoom_value", zoom_value)
+        end
+        if zoom_state == ZoomState.ZoomedIn then
+            zoom_info.zoom_to = zoom_value
+            target_zoom_factor = zoom_value
+            zoom_target = get_target_position(zoom_info)
+        end
+    end
+end
+
+function on_zoom_in(pressed)
+    if pressed then
+        update_zoom_value(zoom_value + zoom_step)
+    end
+end
+
+function on_zoom_out(pressed)
+    if pressed then
+        update_zoom_value(zoom_value - zoom_step)
+    end
 end
 
 function on_toggle_follow(pressed)
@@ -846,10 +924,12 @@ function on_toggle_zoom(pressed)
                 -- To zoom in, we get a new target based on where the mouse was when zoom was clicked
                 zoom_state = ZoomState.ZoomingIn
                 zoom_info.zoom_to = zoom_value
+                target_zoom_factor = zoom_value
                 zoom_time = 0
                 locked_center = nil
                 locked_last_pos = nil
                 zoom_target = get_target_position(zoom_info)
+                last_mouse_pos = get_mouse_pos()
             end
 
             -- Since we are zooming we need to start the timer for the animation and tracking
@@ -864,8 +944,45 @@ end
 
 function on_timer()
     if crop_filter_info ~= nil and zoom_target ~= nil then
+        -- Calculate accurate time delta (dt)
+        local current_time = os.clock()
+        local dt = 0.016
+        if last_timer_time > 0 then
+            dt = current_time - last_timer_time
+        end
+        last_timer_time = current_time
+
+        -- Clamp dt to prevent teleportation during lag or scene switching
+        if dt <= 0 or dt > 0.1 then
+            dt = 0.016
+        end
+
+        -- Idle detection and auto zoom reset logic
+        if use_auto_reset_zoom and zoom_state == ZoomState.ZoomedIn and not is_zoom_locked then
+            local mouse = get_mouse_pos()
+            local dist = math.sqrt((mouse.x - last_mouse_pos.x)^2 + (mouse.y - last_mouse_pos.y)^2)
+            last_mouse_pos = { x = mouse.x, y = mouse.y }
+
+            if dist < 2.0 then
+                idle_time = idle_time + dt
+                if idle_time >= auto_reset_zoom_delay then
+                    target_zoom_factor = 1.0
+                end
+            else
+                idle_time = 0.0
+                target_zoom_factor = zoom_value
+            end
+        else
+            idle_time = 0.0
+            target_zoom_factor = zoom_value
+        end
+
         -- Update our zoom time that we use for the animation
-        zoom_time = zoom_time + zoom_speed
+        if zoom_curve == "instant" then
+            zoom_time = 1.0
+        else
+            zoom_time = zoom_time + zoom_speed
+        end
 
         if zoom_state == ZoomState.ZoomingOut or zoom_state == ZoomState.ZoomingIn then
             -- When we are doing a zoom animation (in or out) we linear interpolate the crop to the target
@@ -875,19 +992,27 @@ function on_timer()
                 if zoom_state == ZoomState.ZoomingIn and use_auto_follow_mouse then
                     zoom_target = get_target_position(zoom_info)
                 end
-                crop_filter_info.x = lerp(crop_filter_info.x, zoom_target.crop.x, ease_in_out(zoom_time))
-                crop_filter_info.y = lerp(crop_filter_info.y, zoom_target.crop.y, ease_in_out(zoom_time))
-                crop_filter_info.w = lerp(crop_filter_info.w, zoom_target.crop.w, ease_in_out(zoom_time))
-                crop_filter_info.h = lerp(crop_filter_info.h, zoom_target.crop.h, ease_in_out(zoom_time))
+                local t_val = get_ease_value(zoom_curve, zoom_time)
+                crop_filter_info.x = lerp(crop_filter_info.x, zoom_target.crop.x, t_val)
+                crop_filter_info.y = lerp(crop_filter_info.y, zoom_target.crop.y, t_val)
+                crop_filter_info.w = lerp(crop_filter_info.w, zoom_target.crop.w, t_val)
+                crop_filter_info.h = lerp(crop_filter_info.h, zoom_target.crop.h, t_val)
                 set_crop_settings(crop_filter_info)
+
+                -- Reset velocity so physical movement starts smoothly from rest
+                cam_vel_x = 0
+                cam_vel_y = 0
             end
         else
             -- If we are not zooming we only move the x/y to follow the mouse (width/height stay constant)
             if is_following_mouse then
-                zoom_target = get_target_position(zoom_info)
+                -- Update target if camera zoom is not locked
+                if not is_zoom_locked then
+                    zoom_target = get_target_position(zoom_info)
+                end
 
                 local skip_frame = false
-                if not use_follow_outside_bounds then
+                if not use_follow_outside_bounds and not is_zoom_locked then
                     if zoom_target.raw_center.x < zoom_target.crop.x or
                         zoom_target.raw_center.x > zoom_target.crop.x + zoom_target.crop.w or
                         zoom_target.raw_center.y < zoom_target.crop.y or
@@ -900,7 +1025,7 @@ function on_timer()
                 if not skip_frame then
                     -- If we have a locked_center it means we are currently in a locked zone and
                     -- shouldn't track the mouse until it moves out of the area
-                    if locked_center ~= nil then
+                    if locked_center ~= nil and not is_zoom_locked then
                         local diff = {
                             x = zoom_target.raw_center.x - locked_center.x,
                             y = zoom_target.raw_center.y - locked_center.y
@@ -924,13 +1049,85 @@ function on_timer()
                         end
                     end
 
-                    if locked_center == nil and (zoom_target.crop.x ~= crop_filter_info.x or zoom_target.crop.y ~= crop_filter_info.y) then
-                        crop_filter_info.x = lerp(crop_filter_info.x, zoom_target.crop.x, follow_speed)
-                        crop_filter_info.y = lerp(crop_filter_info.y, zoom_target.crop.y, follow_speed)
+                    -- Determine target position
+                    local target_x = zoom_target.crop.x
+                    local target_y = zoom_target.crop.y
+
+                    if is_zoom_locked then
+                        target_x = locked_crop_pos.x
+                        target_y = locked_crop_pos.y
+                    elseif locked_center ~= nil then
+                        target_x = locked_crop_pos.x
+                        target_y = locked_crop_pos.y
+                    end
+
+                    -- Check if camera needs to move
+                    local needs_update = false
+                    if math.abs(target_x - crop_filter_info.x) > 0.01 or
+                       math.abs(target_y - crop_filter_info.y) > 0.01 or
+                       math.abs(cam_vel_x) > 0.1 or
+                       math.abs(cam_vel_y) > 0.1 or
+                       math.abs(crop_filter_info.w - zoom_target.crop.w) > 0.1 then
+                        needs_update = true
+                    end
+
+                    if needs_update then
+                        local next_x, next_y
+                        if spring_strength <= 0 then
+                            -- Traditional smooth lerp (no physical oscillations/shaking)
+                            local smooth_factor = clamp(0.0, 1.0, 1.0 - math.exp(-15 * dt * follow_speed))
+                            next_x = lerp(crop_filter_info.x, target_x, smooth_factor)
+                            next_y = lerp(crop_filter_info.y, target_y, smooth_factor)
+                            cam_vel_x = 0
+                            cam_vel_y = 0
+                        else
+                            -- Spring-Damper Physics Integration
+                            local k_s = spring_strength
+                            local k_d = 2 * damping_ratio * math.sqrt(k_s)
+
+                            local ax = k_s * (target_x - crop_filter_info.x) - k_d * cam_vel_x
+                            local ay = k_s * (target_y - crop_filter_info.y) - k_d * cam_vel_y
+
+                            cam_vel_x = cam_vel_x + ax * dt
+                            cam_vel_y = cam_vel_y + ay * dt
+
+                            next_x = crop_filter_info.x + cam_vel_x * dt
+                            next_y = crop_filter_info.y + cam_vel_y * dt
+                        end
+
+                        local max_x = zoom_info.source_size.width - crop_filter_info.w
+                        local max_y = zoom_info.source_size.height - crop_filter_info.h
+
+                        -- Handle boundary collision and reset velocity
+                        if next_x < 0 then
+                            crop_filter_info.x = 0
+                            cam_vel_x = 0
+                        elseif next_x > max_x then
+                            crop_filter_info.x = max_x
+                            cam_vel_x = 0
+                        else
+                            crop_filter_info.x = next_x
+                        end
+
+                        if next_y < 0 then
+                            crop_filter_info.y = 0
+                            cam_vel_y = 0
+                        elseif next_y > max_y then
+                            crop_filter_info.y = max_y
+                            cam_vel_y = 0
+                        else
+                            crop_filter_info.y = next_y
+                        end
+
+                        -- Smoothly transition width and height for dynamic zoom
+                        local zoom_smooth_factor = 1.0 - math.exp(-15 * dt)
+                        crop_filter_info.w = lerp(crop_filter_info.w, zoom_target.crop.w, zoom_smooth_factor)
+                        crop_filter_info.h = lerp(crop_filter_info.h, zoom_target.crop.h, zoom_smooth_factor)
+
                         set_crop_settings(crop_filter_info)
 
                         -- Check to see if the mouse has stopped moving long enough to create a new safe zone
-                        if is_following_mouse and locked_center == nil and locked_last_pos ~= nil then
+                        if is_following_mouse and locked_center == nil and locked_last_pos ~= nil and not is_zoom_locked then
                             local diff = {
                                 x = math.abs(crop_filter_info.x - zoom_target.crop.x),
                                 y = math.abs(crop_filter_info.y - zoom_target.crop.y),
@@ -953,10 +1150,14 @@ function on_timer()
                             end
 
                             if (lock and use_follow_auto_lock) or (diff.x <= follow_safezone_sensitivity and diff.y <= follow_safezone_sensitivity) then
-                                -- Make the new center the position of the current camera (which might not be the same as the mouse since we lerp towards it)
+                                -- Make the new center the position of the current camera
                                 locked_center = {
                                     x = math.floor(crop_filter_info.x + zoom_target.crop.w * 0.5),
                                     y = math.floor(crop_filter_info.y + zoom_target.crop.h * 0.5)
+                                }
+                                locked_crop_pos = {
+                                    x = crop_filter_info.x,
+                                    y = crop_filter_info.y
                                 }
                                 log("Cursor stopped. Tracking locked to " .. locked_center.x .. ", " .. locked_center.y)
                             end
@@ -978,7 +1179,7 @@ function on_timer()
                 log("Zoomed in")
                 zoom_state = ZoomState.ZoomedIn
                 -- If we finished zooming in and we arent tracking the mouse we can also remove the timer
-                should_stop_timer = (not use_auto_follow_mouse) and (not is_following_mouse)
+                should_stop_timer = (not use_auto_follow_mouse) and (not is_following_mouse) and (not use_auto_reset_zoom)
 
                 if use_auto_follow_mouse then
                     is_following_mouse = true
@@ -989,6 +1190,7 @@ function on_timer()
                 if is_following_mouse and follow_border < 50 then
                     zoom_target = get_target_position(zoom_info)
                     locked_center = { x = zoom_target.clamped_center.x, y = zoom_target.clamped_center.y }
+                    locked_crop_pos = { x = zoom_target.crop.x, y = zoom_target.crop.y }
                     log("Cursor stopped. Tracking locked to " .. locked_center.x .. ", " .. locked_center.y)
                 end
             end
@@ -1164,6 +1366,11 @@ function log_current_settings()
         socket_port = socket_port,
         socket_poll = socket_poll,
         debug_logs = debug_logs,
+        spring_strength = spring_strength,
+        damping_ratio = damping_ratio,
+        zoom_step = zoom_step,
+        is_zoom_locked = is_zoom_locked,
+        zoom_curve = zoom_curve,
         version = VERSION
     }
 
@@ -1240,6 +1447,16 @@ function script_properties()
     -- Add the rest of the settings UI
     local zoom = obs.obs_properties_add_float(props, "zoom_value", "缩放倍数 (Zoom Factor)", 1, 5, 0.5)
     local zoom_speed = obs.obs_properties_add_float_slider(props, "zoom_speed", "缩放速度 (Zoom Speed)", 0.01, 1, 0.01)
+
+    local zoom_curve_list = obs.obs_properties_add_list(props, "zoom_curve", "缩放动画类型 (Easing)", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_list_add_string(zoom_curve_list, "平滑缓动 (Ease-In-Out)", "ease_in_out")
+    obs.obs_property_list_add_string(zoom_curve_list, "线性匀速 (Linear)", "linear")
+    obs.obs_property_list_add_string(zoom_curve_list, "加速拉近 (Ease-In)", "ease_in")
+    obs.obs_property_list_add_string(zoom_curve_list, "减速停靠 (Ease-Out)", "ease_out")
+    obs.obs_property_list_add_string(zoom_curve_list, "电影回弹 (Overshoot)", "overshoot")
+    obs.obs_property_list_add_string(zoom_curve_list, "瞬间缩放 (Instant)", "instant")
+    obs.obs_property_set_long_description(zoom_curve_list, "放大/缩小动画使用的过渡曲线类型")
+
     local follow = obs.obs_properties_add_bool(props, "follow", "自动跟随鼠标")
     obs.obs_property_set_long_description(follow,
         "启用时，放大后将自动开始鼠标跟踪，无需等待跟踪切换快捷键")
@@ -1252,6 +1469,22 @@ function script_properties()
     local follow_border = obs.obs_properties_add_int_slider(props, "follow_border", "跟随边缘 (Follow Border)", 0, 50, 1)
     local safezone_sense = obs.obs_properties_add_int_slider(props,
         "follow_safezone_sensitivity", "锁定灵敏度 (Lock Sensitivity)", 1, 20, 1)
+
+    local spring_str = obs.obs_properties_add_float_slider(props, "spring_strength", "跟随弹性强度 (Spring Strength)", 0.0, 50.0, 0.5)
+    obs.obs_property_set_long_description(spring_str, "二阶跟随的弹性硬度，值越大镜头跟随鼠标越快越紧凑。设为 0 则关闭物理弹性，退化为无震荡的传统平滑跟随")
+
+    local damp_ratio = obs.obs_properties_add_float_slider(props, "damping_ratio", "跟随阻尼比 (Damping Ratio)", 0.1, 2.0, 0.05)
+    obs.obs_property_set_long_description(damp_ratio, "二阶跟随的阻尼，值越小回弹越明显，0.6~0.7 为临界舒适值")
+
+    local zoom_step_prop = obs.obs_properties_add_float(props, "zoom_step", "快捷键变焦步长 (Zoom Step)", 0.1, 1.0, 0.1)
+    obs.obs_property_set_long_description(zoom_step_prop, "每次按快捷键放大或缩小时，缩放倍数的增减量")
+
+    local use_idle_reset = obs.obs_properties_add_bool(props, "use_auto_reset_zoom", "空闲自动复原1x")
+    obs.obs_property_set_long_description(use_idle_reset, "启用时，如果鼠标静止不动达到设定时间，镜头将自动缩回到1x比例（不放大）")
+
+    local idle_reset_delay = obs.obs_properties_add_float_slider(props, "auto_reset_zoom_delay", "空闲检测时间 (秒)", 1.0, 10.0, 0.5)
+    obs.obs_property_set_long_description(idle_reset_delay, "鼠标静止多少秒后开始自动复原")
+
     local follow_auto_lock = obs.obs_properties_add_bool(props, "follow_auto_lock", "反向自动锁定")
     obs.obs_property_set_long_description(follow_auto_lock,
         "启用时，将鼠标移至缩放源边缘将开始跟踪，\n" ..
@@ -1328,12 +1561,11 @@ function script_properties()
     local info_text = [[<hr/>
 <b>项目信息</b><br>
 项目名称：obs-auto-zoom<br>
-原项目：<a href="https://github.com/BlankSourceCode/obs-zoom-to-mouse">obs-zoom-to-mouse</a><br>
-说明：本工具仅在汉化和升级部分功能<br>
+说明：OBS自动缩放脚本-领创工作室<br>
 本项目地址：<a href="https://github.com/LACS-Official/obs-auto-zoom">obs-auto-zoom</a><br>
-官网：<a href="https://lacs.cc">lacs.cc</a>]]
+工作室官网：<a href="https://www.lacs.cc">www.lacs.cc</a><br>
+原项目地址：<a href="https://github.com/BlankSourceCode/obs-zoom-to-mouse">obs-zoom-to-mouse</a>]]
     obs.obs_properties_add_text(props, "about_text", info_text, obs.OBS_TEXT_INFO)
-
     return props
 end
 
@@ -1345,12 +1577,24 @@ function script_load(settings)
     is_obs_loaded = current_scene ~= nil -- Current scene is nil on first OBS load
     obs.obs_source_release(current_scene)
 
+    -- Save reference to settings
+    script_settings = settings
+
     -- Add our hotkey
     hotkey_zoom_id = obs.obs_hotkey_register_frontend("toggle_zoom_hotkey", "切换缩放至鼠标",
         on_toggle_zoom)
 
     hotkey_follow_id = obs.obs_hotkey_register_frontend("toggle_follow_hotkey", "在缩放时切换跟随鼠标",
         on_toggle_follow)
+
+    hotkey_lock_id = obs.obs_hotkey_register_frontend("toggle_lock_hotkey", "切换镜头焦点锁定",
+        on_toggle_lock)
+
+    hotkey_zoom_in_id = obs.obs_hotkey_register_frontend("zoom_in_hotkey", "增大缩放倍数",
+        on_zoom_in)
+
+    hotkey_zoom_out_id = obs.obs_hotkey_register_frontend("zoom_out_hotkey", "减小缩放倍数",
+        on_zoom_out)
 
     -- Attempt to reload existing hotkey bindings if we can find any
     local hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.zoom")
@@ -1359,6 +1603,18 @@ function script_load(settings)
 
     hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.follow")
     obs.obs_hotkey_load(hotkey_follow_id, hotkey_save_array)
+    obs.obs_data_array_release(hotkey_save_array)
+
+    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.lock")
+    obs.obs_hotkey_load(hotkey_lock_id, hotkey_save_array)
+    obs.obs_data_array_release(hotkey_save_array)
+
+    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.zoom_in")
+    obs.obs_hotkey_load(hotkey_zoom_in_id, hotkey_save_array)
+    obs.obs_data_array_release(hotkey_save_array)
+
+    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.zoom_out")
+    obs.obs_hotkey_load(hotkey_zoom_out_id, hotkey_save_array)
     obs.obs_data_array_release(hotkey_save_array)
 
     -- Load any other settings
@@ -1385,6 +1641,18 @@ function script_load(settings)
     socket_poll = obs.obs_data_get_int(settings, "socket_poll")
     debug_logs = obs.obs_data_get_bool(settings, "debug_logs")
 
+    -- Load physics and zoom settings
+    spring_strength = obs.obs_data_get_double(settings, "spring_strength")
+    damping_ratio = obs.obs_data_get_double(settings, "damping_ratio")
+    zoom_step = obs.obs_data_get_double(settings, "zoom_step")
+
+    -- Load auto zoom reset settings
+    use_auto_reset_zoom = obs.obs_data_get_bool(settings, "use_auto_reset_zoom")
+    auto_reset_zoom_delay = obs.obs_data_get_double(settings, "auto_reset_zoom_delay")
+
+    -- Load zoom curve setting
+    zoom_curve = obs.obs_data_get_string(settings, "zoom_curve")
+
     obs.obs_frontend_add_event_callback(on_frontend_event)
 
     if debug_logs then
@@ -1409,6 +1677,7 @@ function script_load(settings)
 
     source_name = ""
     use_socket = false
+    target_zoom_factor = zoom_value
     is_script_loaded = true
 end
 
@@ -1428,6 +1697,9 @@ function script_unload()
 
         obs.obs_hotkey_unregister(on_toggle_zoom)
         obs.obs_hotkey_unregister(on_toggle_follow)
+        obs.obs_hotkey_unregister(on_toggle_lock)
+        obs.obs_hotkey_unregister(on_zoom_in)
+        obs.obs_hotkey_unregister(on_zoom_out)
         obs.obs_frontend_remove_event_callback(on_frontend_event)
         release_sceneitem()
     end
@@ -1467,6 +1739,18 @@ function script_defaults(settings)
     obs.obs_data_set_default_int(settings, "socket_port", 12345)
     obs.obs_data_set_default_int(settings, "socket_poll", 10)
     obs.obs_data_set_default_bool(settings, "debug_logs", false)
+
+    -- Default values for physics and custom zoom step
+    obs.obs_data_set_default_double(settings, "spring_strength", 0.0)
+    obs.obs_data_set_default_double(settings, "damping_ratio", 0.6)
+    obs.obs_data_set_default_double(settings, "zoom_step", 0.5)
+
+    -- Default values for auto zoom reset on idle
+    obs.obs_data_set_default_bool(settings, "use_auto_reset_zoom", false)
+    obs.obs_data_set_default_double(settings, "auto_reset_zoom_delay", 3.0)
+
+    -- Default values for zoom easing curve
+    obs.obs_data_set_default_string(settings, "zoom_curve", "ease_in_out")
 end
 
 function script_save(settings)
@@ -1480,6 +1764,24 @@ function script_save(settings)
     if hotkey_follow_id ~= nil then
         local hotkey_save_array = obs.obs_hotkey_save(hotkey_follow_id)
         obs.obs_data_set_array(settings, "obs_zoom_to_mouse.hotkey.follow", hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+
+    if hotkey_lock_id ~= nil then
+        local hotkey_save_array = obs.obs_hotkey_save(hotkey_lock_id)
+        obs.obs_data_set_array(settings, "obs_zoom_to_mouse.hotkey.lock", hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+
+    if hotkey_zoom_in_id ~= nil then
+        local hotkey_save_array = obs.obs_hotkey_save(hotkey_zoom_in_id)
+        obs.obs_data_set_array(settings, "obs_zoom_to_mouse.hotkey.zoom_in", hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+
+    if hotkey_zoom_out_id ~= nil then
+        local hotkey_save_array = obs.obs_hotkey_save(hotkey_zoom_out_id)
+        obs.obs_data_set_array(settings, "obs_zoom_to_mouse.hotkey.zoom_out", hotkey_save_array)
         obs.obs_data_array_release(hotkey_save_array)
     end
 end
@@ -1524,6 +1826,15 @@ function script_update(settings)
     socket_poll = obs.obs_data_get_int(settings, "socket_poll")
     debug_logs = obs.obs_data_get_bool(settings, "debug_logs")
 
+    -- Load physics and zoom settings
+    spring_strength = obs.obs_data_get_double(settings, "spring_strength")
+    damping_ratio = obs.obs_data_get_double(settings, "damping_ratio")
+    zoom_step = obs.obs_data_get_double(settings, "zoom_step")
+    use_auto_reset_zoom = obs.obs_data_get_bool(settings, "use_auto_reset_zoom")
+    auto_reset_zoom_delay = obs.obs_data_get_double(settings, "auto_reset_zoom_delay")
+    zoom_curve = obs.obs_data_get_string(settings, "zoom_curve")
+    script_settings = settings
+
     -- Only do the expensive refresh if the user selected a new source
     if source_name ~= old_source_name and is_obs_loaded then
         refresh_sceneitem(true)
@@ -1555,6 +1866,7 @@ function script_update(settings)
         stop_server()
         start_server()
     end
+    target_zoom_factor = zoom_value
 end
 
 function populate_zoom_sources(list)

@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 150" width="600" height="150">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0F172A" />
+      <stop offset="100%" stop-color="#020617" />
+    </linearGradient>
+    <linearGradient id="blueGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#3b82f6" />
+      <stop offset="100%" stop-color="#60a5fa" />
+    </linearGradient>
+  </defs>
+  <rect width="600" height="150" rx="20" fill="url(#bgGrad)"/>
+
+  <g stroke="#1E293B" stroke-width="1.5" opacity="0.4">
+    <line x1="420" y1="0" x2="570" y2="150"/>
+    <line x1="470" y1="0" x2="600" y2="130"/>
+    <line x1="370" y1="0" x2="520" y2="150"/>
+    <line x1="320" y1="0" x2="470" y2="150"/>
+  </g>
+
+  <g transform="translate(48, 76)">
+    <text x="0" y="0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-weight="900" font-size="42" letter-spacing="1">
+      <tspan fill="url(#blueGrad)">OBS</tspan>
+      <tspan fill="#FFFFFF" dx="16">AUTO ZOOM</tspan>
+    </text>
+    
+    <text x="2" y="32" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-weight="600" font-size="12" fill="#64748B" letter-spacing="3.2">PHYSICS-BASED SMOOTH MOUSE TRACKING</text>
+  </g>
+
+  <rect x="50" y="122" width="80" height="4" rx="2" fill="#3b82f6"/>
+</svg>
