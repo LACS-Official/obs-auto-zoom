@@ -18,3 +18,5 @@ Desktop.ini
 *.tmp
 *.bak
 *~
+obs-auto-zoom-config.json
+webdav_temp_upload.json

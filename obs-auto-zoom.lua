@@ -10,7 +10,8 @@
 
 local obs = obslua
 local ffi = require("ffi")
-local VERSION = "1.0.1"
+local bit = require("bit")
+local VERSION = "1.0.2"
 local CROP_FILTER_NAME = "obs-zoom-to-mouse-crop"
 
 local socket_available, socket = pcall(require, "ljsocket")
@@ -43,6 +44,7 @@ local locked_last_pos = nil
 local hotkey_zoom_id = nil
 local hotkey_follow_id = nil
 local is_timer_running = false
+local zoom_start_crop = { x = 0, y = 0, w = 0, h = 0 }
 
 -- Physics and custom controls
 local spring_strength = 0.0
@@ -100,6 +102,248 @@ local debug_logs = false
 local is_obs_loaded = false
 local is_script_loaded = false
 
+-- Version Check Variables
+local latest_version = nil
+local latest_release_url = "https://github.com/LACS-Official/obs-auto-zoom/releases"
+local has_update_available = false
+local is_checking_update = false
+
+-- Keystroke Visualizer variables
+local enable_keystroke = false
+local keystroke_pos = "follow_mouse"
+local keystroke_offset_x = 30
+local keystroke_offset_y = 30
+local keystroke_duration = 1.5
+local keystroke_font_size = 32
+local keystroke_include_mouse = true
+local keystroke_modifier_only = true
+local keystroke_source = nil
+local keystroke_sceneitem = nil
+local keystroke_fade_timer = 0.0
+local keystroke_last_time = 0.0
+local keystroke_prev_keys = {}
+local keystroke_prev_modifiers = {}
+local is_keystroke_timer_running = false
+
+-- Config Backup & WebDAV variables
+local webdav_url = "https://dav.jianguoyun.com/dav/"
+local webdav_user = ""
+local webdav_pass = ""
+local webdav_folder = "obsautozoom"
+local webdav_file = "obs-auto-zoom-config.json"
+local backup_status_msg = "暂无备份/恢复记录"
+
+-- Forward declarations for Keystroke & WebDAV
+local ensure_keystroke_item = nil
+local apply_keystroke_styling = nil
+local set_keystroke_text = nil
+local show_keystroke_sceneitem = nil
+local hide_keystroke_sceneitem = nil
+local update_keystroke_position = nil
+local on_keystroke_timer = nil
+
+local export_local_config = nil
+local import_local_config = nil
+local webdav_backup_config = nil
+local webdav_restore_config = nil
+local webdav_test_connection = nil
+
+function open_url(url)
+    if not url or url == "" then return end
+    if ffi.os == "Windows" then
+        pcall(function()
+            local shell32 = ffi.load("shell32")
+            if shell32 then
+                ffi.cdef([[
+                    void* ShellExecuteA(void* hwnd, const char* lpOperation, const char* lpFile, const char* lpParameters, const char* lpDirectory, int nShowCmd);
+                ]])
+                shell32.ShellExecuteA(nil, "open", url, nil, nil, 1)
+            else
+                os.execute('start "" "' .. url .. '"')
+            end
+        end)
+    elseif ffi.os == "OSX" then
+        os.execute('open "' .. url .. '"')
+    else
+        os.execute('xdg-open "' .. url .. '"')
+    end
+end
+
+function parse_version_nums(v_str)
+    if not v_str then return {0, 0, 0} end
+    local clean = v_str:match("v?(%d+%.?%d*%.?%d*)") or v_str
+    local parts = {}
+    for num in clean:gmatch("(%d+)") do
+        table.insert(parts, tonumber(num) or 0)
+    end
+    while #parts < 3 do
+        table.insert(parts, 0)
+    end
+    return parts
+end
+
+function is_version_newer(latest, current)
+    local p1 = parse_version_nums(latest)
+    local p2 = parse_version_nums(current)
+    for i = 1, math.max(#p1, #p2) do
+        local n1 = p1[i] or 0
+        local n2 = p2[i] or 0
+        if n1 > n2 then return true end
+        if n1 < n2 then return false end
+    end
+    return false
+end
+
+function http_get(url)
+    if ffi.os == "Windows" then
+        local success, res = pcall(function()
+            local wininet = ffi.load("wininet")
+            if not wininet then return nil end
+
+            ffi.cdef([[
+                typedef void* HINTERNET;
+                HINTERNET InternetOpenA(const char* lpszAgent, uint32_t dwAccessType, const char* lpszProxy, const char* lpszProxyBypass, uint32_t dwFlags);
+                HINTERNET InternetOpenUrlA(HINTERNET hInternet, const char* lpszUrl, const char* lpszHeaders, uint32_t dwHeadersLength, uint32_t dwFlags, uintptr_t dwContext);
+                int InternetReadFile(HINTERNET hFile, void* lpBuffer, uint32_t dwNumberOfBytesToRead, uint32_t* lpdwNumberOfBytesRead);
+                int InternetCloseHandle(HINTERNET hInternet);
+            ]])
+
+            local hInternet = wininet.InternetOpenA("obs-auto-zoom-script", 0, nil, nil, 0)
+            if hInternet == nil or hInternet == ffi.cast("void*", 0) then return nil end
+
+            local flags = 0x80000000 + 0x00800000 + 0x04000000 -- RELOAD + SECURE + NO_CACHE_WRITE
+            local headers = "User-Agent: obs-auto-zoom-script\r\nAccept: application/vnd.github.v3+json\r\n"
+            local hUrl = wininet.InternetOpenUrlA(hInternet, url, headers, -1, flags, 0)
+
+            local content = nil
+            if hUrl ~= nil and hUrl ~= ffi.cast("void*", 0) then
+                local buffer_size = 4096
+                local buffer = ffi.new("char[?]", buffer_size)
+                local read_bytes = ffi.new("uint32_t[1]")
+                local chunks = {}
+
+                repeat
+                    local ok = wininet.InternetReadFile(hUrl, buffer, buffer_size - 1, read_bytes)
+                    if ok ~= 0 and read_bytes[0] > 0 then
+                        table.insert(chunks, ffi.string(buffer, read_bytes[0]))
+                    else
+                        break
+                    end
+                until read_bytes[0] == 0
+
+                wininet.InternetCloseHandle(hUrl)
+                content = table.concat(chunks)
+            end
+            wininet.InternetCloseHandle(hInternet)
+            return content
+        end)
+        if success and res and #res > 0 then
+            return res
+        end
+    end
+
+    local cmd
+    if ffi.os == "Windows" then
+        cmd = 'curl -s -L -A "obs-auto-zoom-script" "' .. url .. '"'
+    else
+        cmd = 'curl -s -L -A "obs-auto-zoom-script" "' .. url .. '"'
+    end
+
+    local handle = io.popen(cmd)
+    if handle then
+        local content = handle:read("*a")
+        handle:close()
+        if content and #content > 0 then
+            return content
+        end
+    end
+
+    return nil
+end
+
+function check_for_updates(is_manual)
+    if is_checking_update then return false end
+    is_checking_update = true
+
+    local tag = nil
+    local html_url = nil
+
+    -- Method 1: Raw GitHub File CDN (Bypasses GitHub REST API rate limits completely)
+    local raw_url = "https://raw.githubusercontent.com/LACS-Official/obs-auto-zoom/main/obs-auto-zoom.lua"
+    local raw_resp = http_get(raw_url)
+    if raw_resp and #raw_resp > 0 then
+        local remote_ver = raw_resp:match('local%s+VERSION%s*=%s*"([^"]+)"')
+        if remote_ver then
+            tag = remote_ver
+            html_url = "https://github.com/LACS-Official/obs-auto-zoom/releases/tag/" .. remote_ver
+        end
+    end
+
+    -- Method 2: GitHub Releases latest page
+    if not tag then
+        local rel_url = "https://github.com/LACS-Official/obs-auto-zoom/releases/latest"
+        local rel_resp = http_get(rel_url)
+        if rel_resp and #rel_resp > 0 then
+            local rel_tag = rel_resp:match('/releases/tag/([^"/?#]+)')
+            if rel_tag then
+                tag = rel_tag
+                html_url = "https://github.com/LACS-Official/obs-auto-zoom/releases/tag/" .. rel_tag
+            end
+        end
+    end
+
+    -- Method 3: GitHub REST API
+    if not tag then
+        local api_url = "https://api.github.com/repos/LACS-Official/obs-auto-zoom/releases/latest"
+        local api_resp = http_get(api_url)
+        if api_resp and #api_resp > 0 then
+            tag = api_resp:match('"tag_name"%s*:%s*"([^"]+)"')
+            local matched_url = api_resp:match('"html_url"%s*:%s*"([^"]+)"')
+            if matched_url then
+                html_url = matched_url:gsub("\\/", "/")
+            end
+        end
+    end
+
+    is_checking_update = false
+
+    if tag then
+        latest_version = tag:gsub("^v", "")
+        if html_url then
+            latest_release_url = html_url
+        else
+            latest_release_url = "https://github.com/LACS-Official/obs-auto-zoom/releases/tag/" .. tag
+        end
+
+        if is_version_newer(latest_version, VERSION) then
+            has_update_available = true
+            obs.script_log(obs.OBS_LOG_WARNING,
+                "\n----------------------------------------------------\n" ..
+                "🚀 [obs-auto-zoom] 检测到 GitHub 新版本发布！\n" ..
+                "当前版本: v" .. VERSION .. "\n" ..
+                "最新版本: v" .. latest_version .. "\n" ..
+                "更新下载地址: " .. latest_release_url .. "\n" ..
+                "----------------------------------------------------\n")
+        else
+            has_update_available = false
+            if is_manual then
+                obs.script_log(obs.OBS_LOG_INFO, "[obs-auto-zoom] 当前已是最新版本 (v" .. VERSION .. ")")
+            end
+        end
+        return true
+    end
+
+    if is_manual then
+        obs.script_log(obs.OBS_LOG_WARNING, "[obs-auto-zoom] 无法连接到 GitHub 检查更新，请稍后再试。")
+    end
+    return false
+end
+
+function on_initial_update_check_timer()
+    obs.timer_remove(on_initial_update_check_timer)
+    check_for_updates(false)
+end
+
 local ZoomState = {
     None = 0,
     ZoomingIn = 1,
@@ -114,6 +358,7 @@ local major = tonumber(m1) or 0
 local minor = tonumber(m2) or 0
 
 -- Define the mouse cursor functions for each platform
+local win_user32 = nil
 if ffi.os == "Windows" then
     ffi.cdef([[
         typedef int BOOL;
@@ -122,8 +367,10 @@ if ffi.os == "Windows" then
             long y;
         } POINT, *LPPOINT;
         BOOL GetCursorPos(LPPOINT);
+        short GetAsyncKeyState(int vKey);
     ]])
     win_point = ffi.new("POINT[1]")
+    pcall(function() win_user32 = ffi.load("user32") end)
 elseif ffi.os == "Linux" then
     ffi.cdef([[
         typedef unsigned long XID;
@@ -361,7 +608,7 @@ function get_monitor_info(source)
                         end
 
                         local item_count = obs.obs_property_list_item_count(monitor_id_prop);
-                        for i = 0, item_count do
+                        for i = 0, item_count - 1 do
                             local name = obs.obs_property_list_item_name(monitor_id_prop, i)
                             local value
                             if dc_info.prop_type == "string" then
@@ -378,29 +625,30 @@ function get_monitor_info(source)
                         obs.obs_data_release(settings)
                     end
 
-                    -- This works for my machine as the monitor names are given as "U2790B: 3840x2160 @ -1920,0 (Primary Monitor)"
-                    -- I don't know if this holds true for other machines and/or OBS versions
-                    -- TODO: Update this with some custom FFI calls to find the monitor top-left x and y coordinates if it doesn't work for anyone else
-                    -- TODO: Refactor this into something that would work with Windows/Linux/Mac assuming we can't do it like this
                     if found then
                         log("Parsing display name: " .. found)
-                        local x, y = found:match("(-?%d+),(-?%d+)")
-                        local width, height = found:match("(%d+)x(%d+)")
+                        local x, y = found:match("(-?%d+),%s*(-?%d+)")
+                        local width, height = found:match("(%d+)%s*x%s*(%d+)")
 
-                        info = { x = 0, y = 0, width = 0, height = 0 }
-                        info.x = tonumber(x, 10)
-                        info.y = tonumber(y, 10)
-                        info.width = tonumber(width, 10)
-                        info.height = tonumber(height, 10)
-                        info.scale_x = 1
-                        info.scale_y = 1
-                        info.display_width = info.width
-                        info.display_height = info.height
+                        local nx = tonumber(x, 10)
+                        local ny = tonumber(y, 10)
+                        local nw = tonumber(width, 10)
+                        local nh = tonumber(height, 10)
 
-                        log("Parsed the following display information\n" .. format_table(info))
-
-                        if info.width == 0 and info.height == 0 then
-                            info = nil
+                        if nx and ny and nw and nh and nw > 0 and nh > 0 then
+                            info = {
+                                x = nx,
+                                y = ny,
+                                width = nw,
+                                height = nh,
+                                scale_x = 1,
+                                scale_y = 1,
+                                display_width = nw,
+                                display_height = nh
+                            }
+                            log("Parsed the following display information\n" .. format_table(info))
+                        else
+                            log("警告：无法从显示名称解析分辩率和位置: " .. found)
                         end
                     end
                 end
@@ -442,12 +690,12 @@ function is_display_capture(source_to_check)
         if dc_info ~= nil then
             -- Do a quick check to ensure this is a display capture
             if allow_all_sources then
+                return true
+            else
                 local source_type = obs.obs_source_get_id(source_to_check)
                 if source_type == dc_info.source_id then
                     return true
                 end
-            else
-                return true
             end
         end
     end
@@ -919,6 +1167,7 @@ function on_toggle_zoom(pressed)
                 locked_center = nil
                 locked_last_pos = nil
                 zoom_target = { crop = crop_filter_info_orig, c = sceneitem_crop_orig }
+                zoom_start_crop = { x = crop_filter_info.x, y = crop_filter_info.y, w = crop_filter_info.w, h = crop_filter_info.h }
                 if is_following_mouse then
                     is_following_mouse = false
                     log("Tracking mouse is off (due to zoom out)")
@@ -933,6 +1182,7 @@ function on_toggle_zoom(pressed)
                 locked_center = nil
                 locked_last_pos = nil
                 zoom_target = get_target_position(zoom_info)
+                zoom_start_crop = { x = crop_filter_info.x, y = crop_filter_info.y, w = crop_filter_info.w, h = crop_filter_info.h }
                 last_mouse_pos = get_mouse_pos()
             end
 
@@ -997,10 +1247,10 @@ function on_timer()
                     zoom_target = get_target_position(zoom_info)
                 end
                 local t_val = get_ease_value(zoom_curve, zoom_time)
-                crop_filter_info.x = lerp(crop_filter_info.x, zoom_target.crop.x, t_val)
-                crop_filter_info.y = lerp(crop_filter_info.y, zoom_target.crop.y, t_val)
-                crop_filter_info.w = lerp(crop_filter_info.w, zoom_target.crop.w, t_val)
-                crop_filter_info.h = lerp(crop_filter_info.h, zoom_target.crop.h, t_val)
+                crop_filter_info.x = lerp(zoom_start_crop.x, zoom_target.crop.x, t_val)
+                crop_filter_info.y = lerp(zoom_start_crop.y, zoom_target.crop.y, t_val)
+                crop_filter_info.w = lerp(zoom_start_crop.w, zoom_target.crop.w, t_val)
+                crop_filter_info.h = lerp(zoom_start_crop.h, zoom_target.crop.h, t_val)
                 set_crop_settings(crop_filter_info)
 
                 -- Reset velocity so physical movement starts smoothly from rest
@@ -1280,11 +1530,15 @@ end
 function on_frontend_event(event)
     if event == obs.OBS_FRONTEND_EVENT_SCENE_CHANGED then
         log("OBS Scene changed")
+        keystroke_sceneitem = nil
         -- If the scene changes we attempt to find a new source with the same name in this new scene
         -- TODO: There probably needs to be a way for users to specify what source they want to use in each scene
         -- Scene change can happen before OBS has completely loaded, so we check for that here
         if is_obs_loaded then
             refresh_sceneitem(true)
+            if enable_keystroke and ensure_keystroke_item then
+                ensure_keystroke_item()
+            end
         end
     elseif event == obs.OBS_FRONTEND_EVENT_FINISHED_LOADING then
         log("OBS Loaded")
@@ -1292,6 +1546,9 @@ function on_frontend_event(event)
         is_obs_loaded = true
         monitor_info = get_monitor_info(source)
         refresh_sceneitem(true)
+        if enable_keystroke and ensure_keystroke_item then
+            ensure_keystroke_item()
+        end
     elseif event == obs.OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN then
         log("OBS Shutting down")
         -- Add a fail-safe for unloading the script during shutdown
@@ -1386,8 +1643,8 @@ end
 
 function on_print_help()
     local help = "\n----------------------------------------------------\n" ..
-        "OBS-Zoom-To-Mouse 帮助信息 v" .. VERSION .. "\n" ..
-        "https://github.com/BlankSourceCode/obs-zoom-to-mouse\n" ..
+        "obs-auto-zoom 帮助信息 v" .. VERSION .. "\n" ..
+        "https://github.com/LACS-Official/obs-auto-zoom\n" ..
         "----------------------------------------------------\n" ..
         "此脚本将缩放选定的显示器采集源以聚焦于鼠标。\n\n" ..
         "缩放源 (Zoom Source): 当前场景中用于缩放的显示器采集源\n" ..
@@ -1425,6 +1682,640 @@ function on_print_help()
 end
 
 
+
+-- ============================================================================
+-- Keystroke Visualizer Module (按键与鼠标可视化)
+-- ============================================================================
+
+local VKEY_LIST = {
+    [0x41] = "A", [0x42] = "B", [0x43] = "C", [0x44] = "D", [0x45] = "E",
+    [0x46] = "F", [0x47] = "G", [0x48] = "H", [0x49] = "I", [0x4A] = "J",
+    [0x4B] = "K", [0x4C] = "L", [0x4D] = "M", [0x4E] = "N", [0x4F] = "O",
+    [0x50] = "P", [0x51] = "Q", [0x52] = "R", [0x53] = "S", [0x54] = "T",
+    [0x55] = "U", [0x56] = "V", [0x57] = "W", [0x58] = "X", [0x59] = "Y", [0x5A] = "Z",
+    [0x30] = "0", [0x31] = "1", [0x32] = "2", [0x33] = "3", [0x34] = "4",
+    [0x35] = "5", [0x36] = "6", [0x37] = "7", [0x38] = "8", [0x39] = "9",
+    [0x60] = "Num 0", [0x61] = "Num 1", [0x62] = "Num 2", [0x63] = "Num 3", [0x64] = "Num 4",
+    [0x65] = "Num 5", [0x66] = "Num 6", [0x67] = "Num 7", [0x68] = "Num 8", [0x69] = "Num 9",
+    [0x6A] = "Num *", [0x6B] = "Num +", [0x6D] = "Num -", [0x6E] = "Num .", [0x6F] = "Num /",
+    [0x70] = "F1", [0x71] = "F2", [0x72] = "F3", [0x73] = "F4", [0x74] = "F5", [0x75] = "F6",
+    [0x76] = "F7", [0x77] = "F8", [0x78] = "F9", [0x79] = "F10", [0x7A] = "F11", [0x7B] = "F12",
+    [0x20] = "Space", [0x0D] = "Enter", [0x1B] = "Esc", [0x08] = "Backspace", [0x09] = "Tab",
+    [0x2E] = "Delete", [0x2D] = "Insert", [0x24] = "Home", [0x23] = "End",
+    [0x21] = "PageUp", [0x22] = "PageDown",
+    [0x26] = "↑", [0x28] = "↓", [0x25] = "←", [0x27] = "→",
+    [0x14] = "CapsLock",
+    [0xBA] = ";", [0xBB] = "=", [0xBC] = ",", [0xBD] = "-", [0xBE] = ".",
+    [0xBF] = "/", [0xC0] = "`", [0xDB] = "[", [0xDC] = "\\", [0xDD] = "]", [0xDE] = "'"
+}
+
+local MOUSE_VKEYS = {
+    [0x01] = "鼠标左键",
+    [0x02] = "鼠标右键",
+    [0x04] = "鼠标中键"
+}
+
+local function is_vkey_down(vkey)
+    if not win_user32 then return false end
+    local state = win_user32.GetAsyncKeyState(vkey)
+    return bit.band(state, 0x8000) ~= 0
+end
+
+set_keystroke_text = function(text)
+    if not keystroke_source then return end
+    local s = obs.obs_data_create()
+    obs.obs_data_set_string(s, "text", text)
+    obs.obs_source_update(keystroke_source, s)
+    obs.obs_data_release(s)
+end
+
+apply_keystroke_styling = function()
+    if not keystroke_source then return end
+    local s = obs.obs_source_get_settings(keystroke_source)
+    if s then
+        local font_obj = obs.obs_data_get_obj(s, "font")
+        if not font_obj then font_obj = obs.obs_data_create() end
+        obs.obs_data_set_string(font_obj, "face", "Microsoft YaHei UI")
+        obs.obs_data_set_int(font_obj, "size", keystroke_font_size)
+        obs.obs_data_set_int(font_obj, "flags", 1) -- Bold
+        obs.obs_data_set_obj(s, "font", font_obj)
+        obs.obs_data_release(font_obj)
+        obs.obs_data_set_int(s, "color", 0xFFFFFFFF)
+        obs.obs_data_set_bool(s, "outline", true)
+        obs.obs_data_set_int(s, "outline_color", 0xFF141414)
+        obs.obs_data_set_int(s, "outline_size", 4)
+        obs.obs_data_set_int(s, "outline_opacity", 100)
+        obs.obs_data_set_int(s, "bk_color", 0xCC1E1E1E)
+        obs.obs_data_set_int(s, "bk_opacity", 85)
+        obs.obs_source_update(keystroke_source, s)
+        obs.obs_data_release(s)
+    end
+end
+
+ensure_keystroke_item = function()
+    if not keystroke_source then
+        keystroke_source = obs.obs_get_source_by_name("[obs-auto-zoom] 按键显示")
+        if not keystroke_source then
+            local text_types = {"text_gdiplus_v2", "text_gdiplus", "text_ft2_source_v2", "text_ft2_source"}
+            for _, t in ipairs(text_types) do
+                local s = obs.obs_data_create()
+                obs.obs_data_set_string(s, "text", "")
+                local font_obj = obs.obs_data_create()
+                obs.obs_data_set_string(font_obj, "face", "Microsoft YaHei UI")
+                obs.obs_data_set_int(font_obj, "size", keystroke_font_size)
+                obs.obs_data_set_int(font_obj, "flags", 1)
+                obs.obs_data_set_obj(s, "font", font_obj)
+                obs.obs_data_release(font_obj)
+                obs.obs_data_set_int(s, "color", 0xFFFFFFFF)
+                obs.obs_data_set_bool(s, "outline", true)
+                obs.obs_data_set_int(s, "outline_color", 0xFF141414)
+                obs.obs_data_set_int(s, "outline_size", 4)
+                obs.obs_data_set_int(s, "outline_opacity", 100)
+                obs.obs_data_set_int(s, "bk_color", 0xCC1E1E1E)
+                obs.obs_data_set_int(s, "bk_opacity", 85)
+                keystroke_source = obs.obs_source_create(t, "[obs-auto-zoom] 按键显示", s, nil)
+                obs.obs_data_release(s)
+                if keystroke_source ~= nil then break end
+            end
+        end
+    end
+    if not keystroke_source then return nil end
+
+    if not keystroke_sceneitem then
+        local cur_scene_source = obs.obs_frontend_get_current_scene()
+        if cur_scene_source ~= nil then
+            local cur_scene = obs.obs_scene_from_source(cur_scene_source)
+            if cur_scene ~= nil then
+                local item = obs.obs_scene_find_source(cur_scene, "[obs-auto-zoom] 按键显示")
+                if not item then
+                    item = obs.obs_scene_add(cur_scene, keystroke_source)
+                end
+                if item then
+                    obs.obs_sceneitem_set_order(item, obs.OBS_ORDER_MOVE_TOP)
+                    keystroke_sceneitem = item
+                end
+            end
+            obs.obs_source_release(cur_scene_source)
+        end
+    end
+    return keystroke_sceneitem
+end
+
+show_keystroke_sceneitem = function()
+    local item = ensure_keystroke_item()
+    if item then
+        obs.obs_sceneitem_set_visible(item, true)
+    end
+end
+
+hide_keystroke_sceneitem = function()
+    if keystroke_sceneitem then
+        obs.obs_sceneitem_set_visible(keystroke_sceneitem, false)
+    end
+end
+
+update_keystroke_position = function()
+    if not keystroke_sceneitem then return end
+
+    local cw, ch = 1920, 1080
+    local ovi = obs.obs_video_info()
+    if obs.obs_get_video_info(ovi) then
+        cw = ovi.base_width
+        ch = ovi.base_height
+    end
+
+    local target_x = 0
+    local target_y = 0
+
+    if keystroke_pos == "follow_mouse" then
+        local mouse = get_mouse_pos()
+        if source ~= nil and sceneitem ~= nil and sceneitem_info ~= nil then
+            local mon_x = (monitor_info and monitor_info.x) or 0
+            local mon_y = (monitor_info and monitor_info.y) or 0
+            local mon_w = (monitor_info and monitor_info.width and monitor_info.width > 0) and monitor_info.width or cw
+            local mon_h = (monitor_info and monitor_info.height and monitor_info.height > 0) and monitor_info.height or ch
+            local bounds_x = (sceneitem_info.bounds and sceneitem_info.bounds.x and sceneitem_info.bounds.x > 0) and sceneitem_info.bounds.x or mon_w
+            local bounds_y = (sceneitem_info.bounds and sceneitem_info.bounds.y and sceneitem_info.bounds.y > 0) and sceneitem_info.bounds.y or mon_h
+            local pos_x = (sceneitem_info.pos and sceneitem_info.pos.x) or 0
+            local pos_y = (sceneitem_info.pos and sceneitem_info.pos.y) or 0
+
+            local is_zoomed = (zoom_state == ZoomState.ZoomedIn or zoom_state == ZoomState.ZoomingIn or zoom_state == ZoomState.ZoomingOut)
+            if is_zoomed and crop_filter_info and crop_filter_info.w and crop_filter_info.w > 0 and crop_filter_info.h and crop_filter_info.h > 0 then
+                local c_x = crop_filter_info.x or 0
+                local c_y = crop_filter_info.y or 0
+                local rel_x = (mouse.x - mon_x - c_x) / crop_filter_info.w
+                local rel_y = (mouse.y - mon_y - c_y) / crop_filter_info.h
+                target_x = pos_x + rel_x * bounds_x + keystroke_offset_x
+                target_y = pos_y + rel_y * bounds_y + keystroke_offset_y
+            else
+                local rel_x = (mouse.x - mon_x) / mon_w
+                local rel_y = (mouse.y - mon_y) / mon_h
+                target_x = pos_x + rel_x * bounds_x + keystroke_offset_x
+                target_y = pos_y + rel_y * bounds_y + keystroke_offset_y
+            end
+        else
+            target_x = (mouse and mouse.x or 0) + keystroke_offset_x
+            target_y = (mouse and mouse.y or 0) + keystroke_offset_y
+        end
+    elseif keystroke_pos == "bottom_center" then
+        target_x = cw * 0.5 + keystroke_offset_x
+        target_y = ch - 120 + keystroke_offset_y
+    elseif keystroke_pos == "bottom_left" then
+        target_x = 60 + keystroke_offset_x
+        target_y = ch - 120 + keystroke_offset_y
+    elseif keystroke_pos == "bottom_right" then
+        target_x = cw - 320 + keystroke_offset_x
+        target_y = ch - 120 + keystroke_offset_y
+    elseif keystroke_pos == "top_center" then
+        target_x = cw * 0.5 + keystroke_offset_x
+        target_y = 60 + keystroke_offset_y
+    elseif keystroke_pos == "top_left" then
+        target_x = 60 + keystroke_offset_x
+        target_y = 60 + keystroke_offset_y
+    elseif keystroke_pos == "top_right" then
+        target_x = cw - 320 + keystroke_offset_x
+        target_y = 60 + keystroke_offset_y
+    else
+        target_x = cw * 0.5 + keystroke_offset_x
+        target_y = ch - 120 + keystroke_offset_y
+    end
+
+    local pos = obs.vec2()
+    pos.x = target_x
+    pos.y = target_y
+    obs.obs_sceneitem_set_pos(keystroke_sceneitem, pos)
+end
+
+function on_keystroke_timer()
+    if not enable_keystroke then return end
+
+    local now = os.clock()
+    local dt = (keystroke_last_time > 0) and (now - keystroke_last_time) or 0.02
+    keystroke_last_time = now
+    if dt <= 0 or dt > 0.1 then dt = 0.02 end
+
+    if keystroke_fade_timer > 0 then
+        keystroke_fade_timer = keystroke_fade_timer - dt
+        if keystroke_fade_timer <= 0 then
+            set_keystroke_text("")
+            hide_keystroke_sceneitem()
+        else
+            update_keystroke_position()
+        end
+    end
+
+    if ffi.os ~= "Windows" or not win_user32 then return end
+
+    local ctrl = is_vkey_down(0x11)
+    local alt = is_vkey_down(0x12)
+    local shift = is_vkey_down(0x10)
+    local win = is_vkey_down(0x5B) or is_vkey_down(0x5C)
+
+    local current_keys = {}
+    local any_new_key = false
+
+    -- Check keyboard keys
+    for vkey, _ in pairs(VKEY_LIST) do
+        if is_vkey_down(vkey) then
+            current_keys[vkey] = true
+            if not keystroke_prev_keys[vkey] then
+                any_new_key = true
+            end
+        end
+    end
+
+    -- Check mouse buttons if enabled
+    if keystroke_include_mouse then
+        for vkey, _ in pairs(MOUSE_VKEYS) do
+            if is_vkey_down(vkey) then
+                current_keys[vkey] = true
+                if not keystroke_prev_keys[vkey] then
+                    any_new_key = true
+                end
+            end
+        end
+    end
+
+    local mod_changed = (ctrl ~= keystroke_prev_modifiers.ctrl) or
+                        (alt ~= keystroke_prev_modifiers.alt) or
+                        (shift ~= keystroke_prev_modifiers.shift) or
+                        (win ~= keystroke_prev_modifiers.win)
+
+    local has_mod = ctrl or alt or shift or win
+    local has_key = next(current_keys) ~= nil
+
+    if any_new_key or (mod_changed and (has_key or (has_mod and keystroke_modifier_only))) then
+        local parts = {}
+        if ctrl then table.insert(parts, "Ctrl") end
+        if alt then table.insert(parts, "Alt") end
+        if shift then table.insert(parts, "Shift") end
+        if win then table.insert(parts, "Win") end
+
+        for vkey, _ in pairs(current_keys) do
+            local name = VKEY_LIST[vkey] or (keystroke_include_mouse and MOUSE_VKEYS[vkey])
+            if name then
+                table.insert(parts, name)
+            end
+        end
+
+        if #parts > 0 then
+            local text = "[ " .. table.concat(parts, " + ") .. " ]"
+            set_keystroke_text(text)
+            keystroke_fade_timer = keystroke_duration
+            show_keystroke_sceneitem()
+            update_keystroke_position()
+        end
+    end
+
+    keystroke_prev_keys = current_keys
+    keystroke_prev_modifiers = { ctrl = ctrl, alt = alt, shift = shift, win = win }
+end
+
+-- ============================================================================
+-- Config Backup & WebDAV Sync Module (配置备份与 WebDAV 云端同步)
+-- ============================================================================
+
+local function get_local_config_file()
+    local dir = (script_path and script_path()) or (obs.script_path and obs.script_path()) or "./"
+    return dir .. "obs-auto-zoom-config.json"
+end
+
+local function reload_hotkeys_from_settings(settings)
+    if not settings then return end
+    local hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.zoom")
+    if hotkey_save_array ~= nil then
+        obs.obs_hotkey_load(hotkey_zoom_id, hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+
+    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.follow")
+    if hotkey_save_array ~= nil then
+        obs.obs_hotkey_load(hotkey_follow_id, hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+
+    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.lock")
+    if hotkey_save_array ~= nil then
+        obs.obs_hotkey_load(hotkey_lock_id, hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+
+    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.zoom_in")
+    if hotkey_save_array ~= nil then
+        obs.obs_hotkey_load(hotkey_zoom_in_id, hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+
+    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.zoom_out")
+    if hotkey_save_array ~= nil then
+        obs.obs_hotkey_load(hotkey_zoom_out_id, hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+end
+
+export_local_config = function()
+    if not script_settings then
+        backup_status_msg = "❌ 导出失败: 当前没有可导出的设置数据"
+        obs.script_log(obs.OBS_LOG_WARNING, "[obs-auto-zoom] " .. backup_status_msg)
+        return false
+    end
+    script_save(script_settings)
+    local json_str = obs.obs_data_get_json(script_settings)
+    local path = get_local_config_file()
+    local f = io.open(path, "w")
+    local timestamp = os.date("%H:%M:%S")
+    if not f then
+        backup_status_msg = string.format("[%s] ❌ 导出失败: 无法写入文件 %s", timestamp, path)
+        obs.script_log(obs.OBS_LOG_ERROR, "[obs-auto-zoom] " .. backup_status_msg)
+        return false
+    end
+    f:write(json_str)
+    f:close()
+    backup_status_msg = string.format("[%s] ✅ 配置已成功导出到本地文件: %s", timestamp, path)
+    obs.script_log(obs.OBS_LOG_INFO, "[obs-auto-zoom] " .. backup_status_msg)
+    return true
+end
+
+import_local_config = function()
+    local path = get_local_config_file()
+    local f = io.open(path, "r")
+    local timestamp = os.date("%H:%M:%S")
+    if not f then
+        backup_status_msg = string.format("[%s] ❌ 导入失败: 未找到本地配置文件 %s", timestamp, path)
+        obs.script_log(obs.OBS_LOG_ERROR, "[obs-auto-zoom] " .. backup_status_msg)
+        return false
+    end
+    local content = f:read("*all")
+    f:close()
+    local loaded = obs.obs_data_create_from_json(content)
+    if not loaded then
+        backup_status_msg = string.format("[%s] ❌ 导入失败: 配置文件 JSON 格式错误", timestamp)
+        obs.script_log(obs.OBS_LOG_ERROR, "[obs-auto-zoom] " .. backup_status_msg)
+        return false
+    end
+    obs.obs_data_apply(script_settings, loaded)
+    reload_hotkeys_from_settings(script_settings)
+    script_update(script_settings)
+    obs.obs_data_release(loaded)
+    backup_status_msg = string.format("[%s] ✅ 本地配置已成功导入并生效！", timestamp)
+    obs.script_log(obs.OBS_LOG_INFO, "[obs-auto-zoom] " .. backup_status_msg)
+    return true
+end
+
+function get_webdav_paths()
+    local url = webdav_url or ""
+    url = url:gsub("^%s*(.-)%s*$", "%1")
+    if url == "" then return nil, nil end
+
+    local filename = webdav_file or "obs-auto-zoom-config.json"
+    filename = filename:gsub("^%s*(.-)%s*$", "%1")
+    if filename == "" then filename = "obs-auto-zoom-config.json" end
+
+    local folder_name = webdav_folder or "obsautozoom"
+    folder_name = folder_name:gsub("^%s*(.-)%s*$", "%1")
+    folder_name = folder_name:gsub("^/+", ""):gsub("/+$", "")
+    if folder_name == "" then folder_name = "obsautozoom" end
+
+    -- 如果用户在 URL 末尾带了 .json 文件名，则分离出路径与文件名
+    if url:match("%.json$") then
+        local base, fname = url:match("^(.-)/([^/]+%.json)$")
+        if base and fname then
+            filename = fname
+            url = base
+        end
+    end
+
+    -- 移除 url 末尾所有斜杠
+    url = url:gsub("/+$", "")
+
+    -- 检查 url 末尾是否已经包含了 target folder（避免重复嵌套如 /obsautozoom/obsautozoom）
+    local folder_url
+    if folder_name == "." or folder_name == "/" then
+        folder_url = url .. "/"
+    else
+        local escaped_folder = folder_name:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
+        if url:match("/" .. escaped_folder .. "$") then
+            folder_url = url .. "/"
+        else
+            folder_url = url .. "/" .. folder_name .. "/"
+        end
+    end
+
+    local file_url = folder_url .. filename
+    return folder_url, file_url
+end
+
+function get_webdav_target_url()
+    local _, file_url = get_webdav_paths()
+    return file_url
+end
+
+function webdav_ensure_folder(folder_url, auth_opt)
+    if not folder_url then return false, "" end
+    -- 使用 WebDAV MKCOL 方法自动创建文件夹
+    -- 根据 RFC 4918：目录已存在时返回 405 Method Not Allowed；新建成功返回 201 Created
+    local cmd = string.format('curl.exe -k -s -w "%%{http_code}" -X MKCOL %s"%s" -o NUL', auth_opt, folder_url)
+    local pipe = io.popen(cmd)
+    local code = pipe and pipe:read("*all") or ""
+    if pipe then pipe:close() end
+    code = code:gsub("%s+", "")
+    local num = tonumber(code)
+    -- 201(新建成功), 405(目录已存在), 200/207(正常) 均代表目录就绪可用
+    if num and (num == 201 or num == 405 or num == 200 or num == 207) then
+        return true, code
+    end
+    return false, code
+end
+
+function webdav_backup_config()
+    local folder_url, file_url = get_webdav_paths()
+    local timestamp = os.date("%H:%M:%S")
+    if not file_url or not folder_url then
+        backup_status_msg = string.format("[%s] ❌ WebDAV 备份失败: 请先填写有效的 WebDAV URL", timestamp)
+        obs.script_log(obs.OBS_LOG_WARNING, "[obs-auto-zoom] " .. backup_status_msg)
+        return false
+    end
+    if not script_settings then return false end
+
+    local safe_user = (webdav_user or ""):gsub('"', '\\"')
+    local safe_pass = (webdav_pass or ""):gsub('"', '\\"')
+    local auth_opt = ""
+    if safe_user ~= "" then
+        auth_opt = string.format('-u "%s:%s" ', safe_user, safe_pass)
+    end
+
+    -- 1. 自动检查并创建远端子目录 (如 obsautozoom)
+    obs.script_log(obs.OBS_LOG_INFO, "[obs-auto-zoom] 正在检查/创建远端备份目录: " .. folder_url)
+    local ok_folder, col_code = webdav_ensure_folder(folder_url, auth_opt)
+    if not ok_folder and col_code ~= "" then
+        obs.script_log(obs.OBS_LOG_WARNING, string.format("[obs-auto-zoom] MKCOL 创建目录返回 HTTP %s (将继续尝试写入)", col_code))
+    end
+
+    -- 2. 导出设置数据到临时文件
+    script_save(script_settings)
+    local json_str = obs.obs_data_get_json(script_settings)
+    local base_dir = (script_path and script_path()) or (obs.script_path and obs.script_path()) or "./"
+    local temp_path = base_dir .. "webdav_temp_upload.json"
+    temp_path = temp_path:gsub("\\", "/")
+    local f = io.open(temp_path, "w")
+    if not f then
+        backup_status_msg = string.format("[%s] ❌ WebDAV 备份失败: 无法创建临时上传文件", timestamp)
+        obs.script_log(obs.OBS_LOG_ERROR, "[obs-auto-zoom] " .. backup_status_msg)
+        return false
+    end
+    f:write(json_str)
+    f:close()
+
+    obs.script_log(obs.OBS_LOG_INFO, "[obs-auto-zoom] 正在上传配置至 WebDAV: " .. file_url)
+
+    -- 3. 使用 curl -T 上传文件 (WebDAV 标准 PUT 上传方式，带精确 Content-Length 与 Content-Type)
+    local cmd = string.format('curl.exe -k -s -w "%%{http_code}" -T "%s" %s-H "Content-Type: application/json" "%s" -o NUL',
+        temp_path, auth_opt, file_url)
+
+    local pipe = io.popen(cmd)
+    local code = pipe and pipe:read("*all") or ""
+    if pipe then pipe:close() end
+
+    code = code:gsub("%s+", "")
+    local num = tonumber(code)
+
+    -- 如果 -T 返回非 2xx，尝试使用备用 -X PUT --data-binary 方式重试一次
+    if not (num and num >= 200 and num < 300) then
+        local cmd_alt = string.format('curl.exe -k -s -w "%%{http_code}" -X PUT %s-H "Content-Type: application/json" --data-binary @"%s" "%s" -o NUL',
+            auth_opt, temp_path, file_url)
+        local pipe_alt = io.popen(cmd_alt)
+        local code_alt = pipe_alt and pipe_alt:read("*all") or ""
+        if pipe_alt then pipe_alt:close() end
+        code_alt = code_alt:gsub("%s+", "")
+        local num_alt = tonumber(code_alt)
+        if num_alt and num_alt >= 200 and num_alt < 300 then
+            code = code_alt
+            num = num_alt
+        end
+    end
+
+    os.remove(temp_path)
+
+    if num and (num >= 200 and num < 300) then
+        backup_status_msg = string.format("[%s] ✅ WebDAV 备份成功！已保存至 %s (HTTP %s)", timestamp, file_url, code)
+        obs.script_log(obs.OBS_LOG_INFO, "[obs-auto-zoom] " .. backup_status_msg)
+        return true
+    else
+        backup_status_msg = string.format("[%s] ❌ WebDAV 备份失败 (HTTP %s)。目标: %s", timestamp, code, file_url)
+        obs.script_log(obs.OBS_LOG_ERROR, "[obs-auto-zoom] " .. backup_status_msg)
+        return false
+    end
+end
+
+function webdav_restore_config()
+    local folder_url, file_url = get_webdav_paths()
+    local timestamp = os.date("%H:%M:%S")
+    if not file_url then
+        backup_status_msg = string.format("[%s] ❌ WebDAV 恢复失败: 请先填写有效的 WebDAV URL", timestamp)
+        obs.script_log(obs.OBS_LOG_WARNING, "[obs-auto-zoom] " .. backup_status_msg)
+        return false
+    end
+
+    obs.script_log(obs.OBS_LOG_INFO, "[obs-auto-zoom] 正在从 WebDAV 下载配置: " .. file_url)
+
+    local safe_user = (webdav_user or ""):gsub('"', '\\"')
+    local safe_pass = (webdav_pass or ""):gsub('"', '\\"')
+    local auth_opt = ""
+    if safe_user ~= "" then
+        auth_opt = string.format('-u "%s:%s" ', safe_user, safe_pass)
+    end
+
+    local cmd = string.format('curl.exe -k -s %s"%s"', auth_opt, file_url)
+    local pipe = io.popen(cmd)
+    local response = pipe and pipe:read("*all") or ""
+    if pipe then pipe:close() end
+
+    -- 如果在指定子目录中没有找到文件，回退检查一下旧根路径以兼容历史备份
+    local used_url = file_url
+    if (not response or response == "" or response:match("^<html") or response:match("^<!DOCTYPE")) and folder_url then
+        local root_file_url = (webdav_url or ""):gsub("/+$", "") .. "/" .. (webdav_file or "obs-auto-zoom-config.json")
+        if root_file_url ~= file_url then
+            obs.script_log(obs.OBS_LOG_INFO, "[obs-auto-zoom] 尝试从备用根路径读取: " .. root_file_url)
+            local cmd_fb = string.format('curl.exe -k -s %s"%s"', auth_opt, root_file_url)
+            local pipe_fb = io.popen(cmd_fb)
+            local resp_fb = pipe_fb and pipe_fb:read("*all") or ""
+            if pipe_fb then pipe_fb:close() end
+            if resp_fb and resp_fb ~= "" and not resp_fb:match("^<html") and not resp_fb:match("^<!DOCTYPE") then
+                response = resp_fb
+                used_url = root_file_url
+            end
+        end
+    end
+
+    if not response or response == "" or response:match("^<html") or response:match("^<!DOCTYPE") then
+        backup_status_msg = string.format("[%s] ❌ WebDAV 恢复失败: 目标文件不存在或返回非 JSON 内容 (URL: %s)", timestamp, used_url)
+        obs.script_log(obs.OBS_LOG_ERROR, "[obs-auto-zoom] " .. backup_status_msg)
+        return false
+    end
+
+    local loaded = obs.obs_data_create_from_json(response)
+    if not loaded then
+        backup_status_msg = string.format("[%s] ❌ WebDAV 恢复失败: 返回数据无法解析为有效 JSON (可能为 404 或认证失败页)", timestamp)
+        obs.script_log(obs.OBS_LOG_ERROR, "[obs-auto-zoom] " .. backup_status_msg)
+        return false
+    end
+
+    obs.obs_data_apply(script_settings, loaded)
+    reload_hotkeys_from_settings(script_settings)
+    script_update(script_settings)
+    obs.obs_data_release(loaded)
+
+    backup_status_msg = string.format("[%s] ✅ WebDAV 配置恢复成功并已应用！(来自 %s)", timestamp, used_url)
+    obs.script_log(obs.OBS_LOG_INFO, "[obs-auto-zoom] " .. backup_status_msg)
+    return true
+end
+
+function webdav_test_connection()
+    local folder_url, file_url = get_webdav_paths()
+    local url = webdav_url or ""
+    url = url:gsub("^%s*(.-)%s*$", "%1")
+    local timestamp = os.date("%H:%M:%S")
+    if url == "" then
+        backup_status_msg = string.format("[%s] ❌ 请先填写 WebDAV 服务器 URL", timestamp)
+        obs.script_log(obs.OBS_LOG_WARNING, "[obs-auto-zoom] " .. backup_status_msg)
+        return false
+    end
+
+    local safe_user = (webdav_user or ""):gsub('"', '\\"')
+    local safe_pass = (webdav_pass or ""):gsub('"', '\\"')
+    local auth_opt = ""
+    if safe_user ~= "" then
+        auth_opt = string.format('-u "%s:%s" ', safe_user, safe_pass)
+    end
+
+    -- 1. 验证 WebDAV 基础连接与身份验证 (PROPFIND)
+    local cmd = string.format('curl.exe -k -s -w "%%{http_code}" -X PROPFIND %s"%s" -o NUL', auth_opt, url)
+    local pipe = io.popen(cmd)
+    local code = pipe and pipe:read("*all") or ""
+    if pipe then pipe:close() end
+
+    code = code:gsub("%s+", "")
+    local num = tonumber(code)
+    if num and (num == 207 or (num >= 200 and num < 300)) then
+        -- 2. 检查并尝试创建备份子目录 (如 obsautozoom)
+        if folder_url then
+            local folder_ok, col_code = webdav_ensure_folder(folder_url, auth_opt)
+            if folder_ok then
+                backup_status_msg = string.format("[%s] ✅ WebDAV 连接成功 (HTTP %s)！备份目录 [%s] 已就绪", timestamp, code, webdav_folder or "obsautozoom")
+            else
+                backup_status_msg = string.format("[%s] ✅ WebDAV 基础连接成功 (HTTP %s)，但备份子目录返回 HTTP %s", timestamp, code, col_code)
+            end
+        else
+            backup_status_msg = string.format("[%s] ✅ WebDAV 连接成功 (HTTP %s)！", timestamp, code)
+        end
+        obs.script_log(obs.OBS_LOG_INFO, "[obs-auto-zoom] " .. backup_status_msg)
+        return true
+    else
+        backup_status_msg = string.format("[%s] ⚠️ WebDAV 连接返回 HTTP %s (请确认账号密码与 URL 路径)", timestamp, code)
+        obs.script_log(obs.OBS_LOG_INFO, "[obs-auto-zoom] " .. backup_status_msg)
+        return false
+    end
+end
 
 function script_description()
     return "缩放选定的显示器采集源以聚焦于鼠标"
@@ -1539,6 +2430,76 @@ function script_properties()
         obs.obs_property_set_modified_callback(socket, on_settings_modified)
     end
 
+    -- ========================================================================
+    -- Keystroke Visualizer Properties
+    -- ========================================================================
+    local key_props = obs.obs_properties_create()
+    local pos_list = obs.obs_properties_add_list(key_props, "keystroke_pos", "显示位置", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_list_add_string(pos_list, "跟随鼠标光标 (Follow Cursor)", "follow_mouse")
+    obs.obs_property_list_add_string(pos_list, "固定: 屏幕底部居中", "bottom_center")
+    obs.obs_property_list_add_string(pos_list, "固定: 屏幕左下角", "bottom_left")
+    obs.obs_property_list_add_string(pos_list, "固定: 屏幕右下角", "bottom_right")
+    obs.obs_property_list_add_string(pos_list, "固定: 屏幕顶部居中", "top_center")
+    obs.obs_property_list_add_string(pos_list, "固定: 屏幕左上角", "top_left")
+    obs.obs_property_list_add_string(pos_list, "固定: 屏幕右上角", "top_right")
+
+    obs.obs_properties_add_int_slider(key_props, "keystroke_offset_x", "水平偏移微调 X (px)", -500, 500, 5)
+    obs.obs_properties_add_int_slider(key_props, "keystroke_offset_y", "垂直偏移微调 Y (px)", -500, 500, 5)
+    obs.obs_properties_add_float_slider(key_props, "keystroke_duration", "按键气泡停留时间 (秒)", 0.5, 5.0, 0.1)
+    obs.obs_properties_add_int_slider(key_props, "keystroke_font_size", "字体大小 (pt)", 16, 72, 2)
+    obs.obs_properties_add_bool(key_props, "keystroke_include_mouse", "同时显示鼠标点击 (左键/右键/中键)")
+    obs.obs_properties_add_bool(key_props, "keystroke_modifier_only", "单独按下 Ctrl/Alt/Shift/Win 也显示")
+
+    local key_group = obs.obs_properties_add_group(props, "enable_keystroke", "⌨️ 开启按键与鼠标可视化 (Keystroke OSD)", obs.OBS_GROUP_CHECKABLE, key_props)
+    obs.obs_property_set_long_description(key_group, "勾选后将在 OBS 画面中实时显示键盘快捷键与鼠标点击动作，支持自定义显示位置与偏移")
+
+    -- ========================================================================
+    -- Config Backup & WebDAV Sync Properties
+    -- ========================================================================
+    local backup_props = obs.obs_properties_create()
+
+    local btn_export = obs.obs_properties_add_button(backup_props, "btn_export_local", "📤 导出配置到本地文件 (obs-auto-zoom-config.json)", function()
+        export_local_config()
+        return true
+    end)
+    obs.obs_property_set_long_description(btn_export, "将当前所有参数设置导出保存到脚本目录的 obs-auto-zoom-config.json 文件")
+
+    local btn_import = obs.obs_properties_add_button(backup_props, "btn_import_local", "📥 从本地文件导入配置", function()
+        import_local_config()
+        return true
+    end)
+    obs.obs_property_set_long_description(btn_import, "从脚本目录读取 obs-auto-zoom-config.json 并恢复所有参数设置")
+
+    local dav_props = obs.obs_properties_create()
+    obs.obs_properties_add_text(dav_props, "webdav_url", "WebDAV 服务器 URL", obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_text(dav_props, "webdav_user", "WebDAV 用户名 / 账号", obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_text(dav_props, "webdav_pass", "WebDAV 密码 / 授权应用密码", obs.OBS_TEXT_PASSWORD)
+    local fld_prop = obs.obs_properties_add_text(dav_props, "webdav_folder", "远端备份文件夹", obs.OBS_TEXT_DEFAULT)
+    obs.obs_property_set_long_description(fld_prop, "备份存放的子目录名称，默认为 obsautozoom（如果远端不存在将自动新建此文件夹）")
+    obs.obs_properties_add_text(dav_props, "webdav_file", "远端存储文件名", obs.OBS_TEXT_DEFAULT)
+
+    local btn_test_dav = obs.obs_properties_add_button(dav_props, "btn_test_dav", "🔍 测试 WebDAV 连接", function()
+        webdav_test_connection()
+        return true
+    end)
+
+    local btn_up_dav = obs.obs_properties_add_button(dav_props, "btn_up_dav", "☁️ 备份配置到 WebDAV (Upload)", function()
+        webdav_backup_config()
+        return true
+    end)
+    obs.obs_property_set_long_description(btn_up_dav, "将当前脚本设置打包并作为 JSON 文件上传至 WebDAV 服务器")
+
+    local btn_down_dav = obs.obs_properties_add_button(dav_props, "btn_down_dav", "☁️ 从 WebDAV 恢复配置 (Download)", function()
+        webdav_restore_config()
+        return true
+    end)
+    obs.obs_property_set_long_description(btn_down_dav, "从 WebDAV 服务器下载配置文件并立即应用到当前脚本")
+
+    obs.obs_properties_add_group(backup_props, "webdav_group", "WebDAV 云端同步设置 (支持坚果云/群晖/Nextcloud等)", obs.OBS_GROUP_NORMAL, dav_props)
+
+    local backup_group = obs.obs_properties_add_group(props, "backup_root_group", "💾 配置导入导出与云端备份 (WebDAV)", obs.OBS_GROUP_NORMAL, backup_props)
+    obs.obs_property_set_long_description(backup_group, "支持本地 JSON 文件配置导入导出，以及通过 WebDAV 协议进行云端备份与恢复")
+
     -- Add a button for more information
     local help = obs.obs_properties_add_button(props, "help_button", "更多信息", on_print_help)
     obs.obs_property_set_long_description(help,
@@ -1561,6 +2522,25 @@ function script_properties()
 
     obs.obs_property_set_modified_callback(allow_all, on_settings_modified)
     obs.obs_property_set_modified_callback(debug, on_settings_modified)
+
+    if has_update_available and latest_version then
+        local notice_html = "<hr/><b style='color:#e74c3c;'>🚀 检测到新版本 v" .. latest_version .. "！(当前版本 v" .. VERSION .. ")</b><br>" ..
+            "请点击下方按钮前往 GitHub 下载最新发布版本。<br/>"
+        obs.obs_properties_add_text(props, "update_notice_text", notice_html, obs.OBS_TEXT_INFO)
+
+        local download_btn = obs.obs_properties_add_button(props, "download_update_btn", "🚀 前往 GitHub 下载最新版本 (v" .. latest_version .. ")", function()
+            open_url(latest_release_url)
+            return false
+        end)
+        obs.obs_property_set_long_description(download_btn, "点击在默认浏览器中打开 GitHub Releases 页面下载最新版本")
+    end
+
+    local check_update_btn = obs.obs_properties_add_button(props, "check_update_btn", "🔍 检查版本更新 (当前 v" .. VERSION .. ")", function()
+        obs.script_log(obs.OBS_LOG_INFO, "[obs-auto-zoom] 正在检查 GitHub 版本更新...")
+        check_for_updates(true)
+        return true
+    end)
+    obs.obs_property_set_long_description(check_update_btn, "手动连接 GitHub Releases 检测是否有新版本发布")
 
     local info_text = [[<hr/>
 <b>项目信息</b><br>
@@ -1585,41 +2565,23 @@ function script_load(settings)
     script_settings = settings
 
     -- Add our hotkey
-    hotkey_zoom_id = obs.obs_hotkey_register_frontend("toggle_zoom_hotkey", "切换缩放至鼠标",
+    hotkey_zoom_id = obs.obs_hotkey_register_frontend("toggle_zoom_hotkey", "[obs-auto-zoom] 切换缩放至鼠标",
         on_toggle_zoom)
 
-    hotkey_follow_id = obs.obs_hotkey_register_frontend("toggle_follow_hotkey", "在缩放时切换跟随鼠标",
+    hotkey_follow_id = obs.obs_hotkey_register_frontend("toggle_follow_hotkey", "[obs-auto-zoom] 在缩放时切换跟随鼠标",
         on_toggle_follow)
 
-    hotkey_lock_id = obs.obs_hotkey_register_frontend("toggle_lock_hotkey", "切换镜头焦点锁定",
+    hotkey_lock_id = obs.obs_hotkey_register_frontend("toggle_lock_hotkey", "[obs-auto-zoom] 切换镜头焦点锁定",
         on_toggle_lock)
 
-    hotkey_zoom_in_id = obs.obs_hotkey_register_frontend("zoom_in_hotkey", "增大缩放倍数",
+    hotkey_zoom_in_id = obs.obs_hotkey_register_frontend("zoom_in_hotkey", "[obs-auto-zoom] 增大缩放倍数",
         on_zoom_in)
 
-    hotkey_zoom_out_id = obs.obs_hotkey_register_frontend("zoom_out_hotkey", "减小缩放倍数",
+    hotkey_zoom_out_id = obs.obs_hotkey_register_frontend("zoom_out_hotkey", "[obs-auto-zoom] 减小缩放倍数",
         on_zoom_out)
 
     -- Attempt to reload existing hotkey bindings if we can find any
-    local hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.zoom")
-    obs.obs_hotkey_load(hotkey_zoom_id, hotkey_save_array)
-    obs.obs_data_array_release(hotkey_save_array)
-
-    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.follow")
-    obs.obs_hotkey_load(hotkey_follow_id, hotkey_save_array)
-    obs.obs_data_array_release(hotkey_save_array)
-
-    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.lock")
-    obs.obs_hotkey_load(hotkey_lock_id, hotkey_save_array)
-    obs.obs_data_array_release(hotkey_save_array)
-
-    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.zoom_in")
-    obs.obs_hotkey_load(hotkey_zoom_in_id, hotkey_save_array)
-    obs.obs_data_array_release(hotkey_save_array)
-
-    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.zoom_out")
-    obs.obs_hotkey_load(hotkey_zoom_out_id, hotkey_save_array)
-    obs.obs_data_array_release(hotkey_save_array)
+    reload_hotkeys_from_settings(settings)
 
     -- Load any other settings
     zoom_value = obs.obs_data_get_double(settings, "zoom_value")
@@ -1657,6 +2619,33 @@ function script_load(settings)
     -- Load zoom curve setting
     zoom_curve = obs.obs_data_get_string(settings, "zoom_curve")
 
+    -- Load keystroke visualizer settings
+    enable_keystroke = obs.obs_data_get_bool(settings, "enable_keystroke")
+    keystroke_pos = obs.obs_data_get_string(settings, "keystroke_pos")
+    if keystroke_pos == "" then keystroke_pos = "follow_mouse" end
+    keystroke_offset_x = obs.obs_data_get_int(settings, "keystroke_offset_x")
+    keystroke_offset_y = obs.obs_data_get_int(settings, "keystroke_offset_y")
+    keystroke_duration = obs.obs_data_get_double(settings, "keystroke_duration")
+    if keystroke_duration <= 0 then keystroke_duration = 1.5 end
+    keystroke_font_size = obs.obs_data_get_int(settings, "keystroke_font_size")
+    if keystroke_font_size <= 0 then keystroke_font_size = 32 end
+    keystroke_include_mouse = obs.obs_data_get_bool(settings, "keystroke_include_mouse")
+    keystroke_modifier_only = obs.obs_data_get_bool(settings, "keystroke_modifier_only")
+
+    -- Load WebDAV settings
+    webdav_url = obs.obs_data_get_string(settings, "webdav_url")
+    webdav_user = obs.obs_data_get_string(settings, "webdav_user")
+    webdav_pass = obs.obs_data_get_string(settings, "webdav_pass")
+    webdav_folder = obs.obs_data_get_string(settings, "webdav_folder")
+    if webdav_folder == "" then webdav_folder = "obsautozoom" end
+    webdav_file = obs.obs_data_get_string(settings, "webdav_file")
+    if webdav_file == "" then webdav_file = "obs-auto-zoom-config.json" end
+
+    if enable_keystroke then
+        is_keystroke_timer_running = true
+        obs.timer_add(on_keystroke_timer, 20)
+    end
+
     obs.obs_frontend_add_event_callback(on_frontend_event)
 
     if debug_logs then
@@ -1683,10 +2672,22 @@ function script_load(settings)
     use_socket = false
     target_zoom_factor = zoom_value
     is_script_loaded = true
+
+    -- Schedule async update check 2 seconds after loading script
+    obs.timer_add(on_initial_update_check_timer, 2000)
 end
 
 function script_unload()
     is_script_loaded = false
+
+    if is_keystroke_timer_running then
+        obs.timer_remove(on_keystroke_timer)
+        is_keystroke_timer_running = false
+    end
+    if keystroke_source then
+        obs.obs_source_release(keystroke_source)
+        keystroke_source = nil
+    end
 
     -- Clean up the memory usage
     if major > 29.1 or (major == 29.1 and minor > 2) then -- 29.1.2 and below seems to crash if you do this, so we ignore it as the script is closing anyway
@@ -1721,6 +2722,7 @@ end
 
 function script_defaults(settings)
     -- Default values for the script
+    obs.obs_data_set_default_string(settings, "source", "")
     obs.obs_data_set_default_double(settings, "zoom_value", 2)
     obs.obs_data_set_default_double(settings, "zoom_speed", 0.06)
     obs.obs_data_set_default_bool(settings, "follow", true)
@@ -1755,6 +2757,23 @@ function script_defaults(settings)
 
     -- Default values for zoom easing curve
     obs.obs_data_set_default_string(settings, "zoom_curve", "ease_in_out")
+
+    -- Default values for keystroke visualizer
+    obs.obs_data_set_default_bool(settings, "enable_keystroke", false)
+    obs.obs_data_set_default_string(settings, "keystroke_pos", "follow_mouse")
+    obs.obs_data_set_default_int(settings, "keystroke_offset_x", 30)
+    obs.obs_data_set_default_int(settings, "keystroke_offset_y", 30)
+    obs.obs_data_set_default_double(settings, "keystroke_duration", 1.5)
+    obs.obs_data_set_default_int(settings, "keystroke_font_size", 32)
+    obs.obs_data_set_default_bool(settings, "keystroke_include_mouse", true)
+    obs.obs_data_set_default_bool(settings, "keystroke_modifier_only", true)
+
+    -- Default values for WebDAV backup
+    obs.obs_data_set_default_string(settings, "webdav_url", "https://dav.jianguoyun.com/dav/")
+    obs.obs_data_set_default_string(settings, "webdav_user", "")
+    obs.obs_data_set_default_string(settings, "webdav_pass", "")
+    obs.obs_data_set_default_string(settings, "webdav_folder", "obsautozoom")
+    obs.obs_data_set_default_string(settings, "webdav_file", "obs-auto-zoom-config.json")
 end
 
 function script_save(settings)
@@ -1837,6 +2856,45 @@ function script_update(settings)
     use_auto_reset_zoom = obs.obs_data_get_bool(settings, "use_auto_reset_zoom")
     auto_reset_zoom_delay = obs.obs_data_get_double(settings, "auto_reset_zoom_delay")
     zoom_curve = obs.obs_data_get_string(settings, "zoom_curve")
+
+    -- Load keystroke visualizer settings
+    enable_keystroke = obs.obs_data_get_bool(settings, "enable_keystroke")
+    keystroke_pos = obs.obs_data_get_string(settings, "keystroke_pos")
+    if keystroke_pos == "" then keystroke_pos = "follow_mouse" end
+    keystroke_offset_x = obs.obs_data_get_int(settings, "keystroke_offset_x")
+    keystroke_offset_y = obs.obs_data_get_int(settings, "keystroke_offset_y")
+    keystroke_duration = obs.obs_data_get_double(settings, "keystroke_duration")
+    if keystroke_duration <= 0 then keystroke_duration = 1.5 end
+    keystroke_font_size = obs.obs_data_get_int(settings, "keystroke_font_size")
+    if keystroke_font_size <= 0 then keystroke_font_size = 32 end
+    keystroke_include_mouse = obs.obs_data_get_bool(settings, "keystroke_include_mouse")
+    keystroke_modifier_only = obs.obs_data_get_bool(settings, "keystroke_modifier_only")
+
+    -- Load WebDAV settings
+    webdav_url = obs.obs_data_get_string(settings, "webdav_url")
+    webdav_user = obs.obs_data_get_string(settings, "webdav_user")
+    webdav_pass = obs.obs_data_get_string(settings, "webdav_pass")
+    webdav_folder = obs.obs_data_get_string(settings, "webdav_folder")
+    if webdav_folder == "" then webdav_folder = "obsautozoom" end
+    webdav_file = obs.obs_data_get_string(settings, "webdav_file")
+    if webdav_file == "" then webdav_file = "obs-auto-zoom-config.json" end
+
+    if enable_keystroke then
+        if not is_keystroke_timer_running then
+            is_keystroke_timer_running = true
+            obs.timer_add(on_keystroke_timer, 20)
+        end
+        ensure_keystroke_item()
+        apply_keystroke_styling()
+    else
+        if is_keystroke_timer_running then
+            is_keystroke_timer_running = false
+            obs.timer_remove(on_keystroke_timer)
+        end
+        set_keystroke_text("")
+        hide_keystroke_sceneitem()
+    end
+
     script_settings = settings
 
     -- Only do the expensive refresh if the user selected a new source
@@ -1853,9 +2911,9 @@ function script_update(settings)
         monitor_override_h ~= old_h or
         monitor_override_sx ~= old_sx or
         monitor_override_sy ~= old_sy or
-        monitor_override_w ~= old_dw or
-        monitor_override_h ~= old_dh then
-        if is_obs_loaded then
+        monitor_override_dw ~= old_dw or
+        monitor_override_dh ~= old_dh then
+        if is_obs_loaded and source ~= nil then
             monitor_info = get_monitor_info(source)
         end
     end

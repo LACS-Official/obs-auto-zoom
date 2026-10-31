@@ -1,95 +1,109 @@
 <p align="center">
-  <img src="logo.svg" width="500" alt="obs-auto-zoom logo"/>
+  <img src="logo.svg" width="460" alt="obs-auto-zoom logo"/>
 </p>
 
-<h1 align="center">OBS 自动跟随鼠标缩放脚本 (obs-auto-zoom)</h1>
+# obs-auto-zoom
 
-<p align="center">
-  <a href="https://github.com/LACS-Official/obs-auto-zoom/blob/main/LICENSE"><img src="https://img.shields.io/github/license/LACS-Official/obs-auto-zoom?color=blue" alt="License MIT"/></a>
-  <img src="https://img.shields.io/badge/OBS-30.0%2B-blue?logo=obsstudio&logoColor=white" alt="OBS Version"/>
-  <img src="https://img.shields.io/badge/Language-Lua-000080?logo=lua&logoColor=white" alt="Language Lua"/>
-  <img src="https://img.shields.io/badge/OS-Windows%20%7C%20macOS%20%7C%20Linux-green" alt="OS Support"/>
-</p>
-
-<p align="center">
-  <b>一款高阶的 OBS 自动缩放与鼠标跟随插件，专为授课、演示、软件教程录制及直播设计。</b>
-</p>
-
-<hr />
-
-## 🌟 核心特性
-
-- 🎬 **电影级平滑跟随 (Spring-Damper)**：
-  - 引入了二阶阻尼弹簧物理算法，让镜头的运动具有自然的惯性缓冲与回弹，告别生硬死板的线性漂移。
-  - 支持在 UI 中实时调整“跟随弹性强度”和“跟随阻尼比”，打造最适合您视线习惯的滑行阻尼。
-  - 支持退化为传统的无震荡指数平滑跟随（将弹性强度调至 `0.0` 即可）。
-
-- ⏳ **空闲自动复原 1x**：
-  - 当鼠标静止不动达到设定时间（例如 3 秒），镜头会自动极其柔和地拉远并缩回到 1x 比例（显示完整屏幕）。
-  - 一旦鼠标再次移动，镜头会迅速平滑地重新拉近聚拢到鼠标位置。
-
-- 🔒 **焦点锁定快捷键**：
-  - 随时一键将镜头锁定在当前所在画面区域，允许鼠标移至其他地方进行无关点击，再次按下快捷键恢复跟随。
-
-- 🎡 **动态快捷键变焦**：
-  - 无需打开脚本面板，在放大状态下可直接使用快捷键（以 0.5 步长）动态拉近或拉远镜头，镜头伸缩过渡完全平顺。
-
-- 💻 **完美的跨平台与高DPI兼容**：
-  - 采用 Lua FFI 技术，深度适配 Windows (`GetCursorPos`)、Linux (`XQueryPointer`) 和 macOS (`NSEvent`) 鼠标坐标捕获。
-  - 内置 UDP 远程鼠标监听服务，支持外部工具或远程客户端实时控制。
+[简体中文](#obs-auto-zoom) | [English](#english)
 
 ---
 
-## 🛠️ 安装指南
+## 简体中文
 
-1. **下载脚本**：
-   - 下载本项目中的 [obs-auto-zoom.lua](obs-auto-zoom.lua) 到您的本地目录。
-2. **导入 OBS**：
-   - 打开 OBS Studio，在上方菜单栏选择 `工具` -> `脚本`。
-   - 在弹出的窗口中，点击左下角的 **`+`** 按钮，选择下载好的 `obs-auto-zoom.lua` 导入。
-3. **选择缩放源**：
-   - 在右侧的属性面板中，将 **缩放源 (Zoom Source)** 下拉列表设置为您当前场景中对应的显示器采集源。
-   - 点击 **刷新缩放源** 按钮可以强制重新扫描可用源。
+适用于 OBS Studio 的鼠标跟随缩放脚本。在录制教程、演示操作或教学直播时，可通过快捷键平滑放大画面并聚焦到光标所在区域。
 
----
+### 功能特性
 
-## ⌨️ 快捷键设置与使用
+- **平滑鼠标跟随**：基于阻尼弹簧算法实现平滑移动与缓冲，也可将弹性强度设为 0 使用常规平滑跟随。
+- **按键与鼠标操作可视化 (Keystroke OSD)**：在画面上实时显示键盘按键组合（如 `Ctrl + C`）及鼠标点击状态，支持自定义显示位置、像素偏移与停留时长。
+- **空闲自动复原**：光标静止达到设定时长后，镜头自动平滑拉远回 1x 全屏。
+- **快捷键动态变焦与锁定**：支持通过快捷键步进放大/缩小画面（步长可调），或一键锁定镜头当前视口焦点。
+- **配置导入导出与 WebDAV 同步**：支持将所有参数及快捷键导出为本地 JSON 文件，支持通过 WebDAV 协议（坚果云、Nextcloud、群晖 NAS、ALiST 等）一键上传至 `obsautozoom` 目录备份与跨设备恢复。
+- **跨平台兼容**：基于 Lua FFI 实现，原生适配 Windows、Linux 及 macOS 系统光标坐标捕获。
 
-导入脚本后，请前往 OBS 的 **设置 -> 快捷键**，往下滚动或搜索 `obs-auto-zoom`，为以下功能绑定您顺手的快捷键：
+### 安装与使用
 
-| 快捷键名称 | 推荐绑定键 | 功能描述 |
+1. **下载脚本**：下载本仓库的 `obs-auto-zoom.lua` 文件。
+2. **加载脚本**：打开 OBS Studio，点击顶部菜单栏 **工具 -> 脚本**，在弹出窗口点击左下角 **`+`** 导入 `obs-auto-zoom.lua`。
+3. **选择缩放源**：在右侧属性面板的 **缩放源 (Zoom Source)** 下拉框中，选择要缩放的显示器采集源。
+4. **配置快捷键**：进入 OBS **设置 -> 快捷键**，搜索 `obs-auto-zoom`，配置所需快捷键（例如将“切换缩放至鼠标”绑定为 `Alt + Z`）。
+
+### 快捷键说明
+
+在 OBS 的 **设置 -> 快捷键** 中搜索 `[obs-auto-zoom]` 即可配置以下动作：
+
+| 快捷键名称 | 推荐绑定键 | 功能说明 |
 | :--- | :--- | :--- |
-| **切换缩放至鼠标** | `Alt + Z` | 开启或关闭放大状态。 |
-| **切换镜头焦点锁定** | `Alt + L` | 锁死当前放大的视口，鼠标移开时不跟随（空闲缩回会自动在此状态下暂停）。 |
-| **增大缩放倍数** | `Alt + =` | 动态拉近变焦倍数（步长可通过滑块设置，默认 0.5）。 |
-| **减小缩放倍数** | `Alt + -` | 动态拉远变焦倍数。 |
-| **在缩放时切换跟随鼠标** | `Alt + F` | 临时开启/关闭鼠标跟随（通常保持默认即可）。 |
+| **[obs-auto-zoom] 切换缩放至鼠标** | `Alt + Z` | 开启或关闭画面放大跟随 |
+| **[obs-auto-zoom] 切换镜头焦点锁定** | `Alt + L` | 锁定当前视口，鼠标移动时不跟随镜头 |
+| **[obs-auto-zoom] 增大缩放倍数** | `Alt + =` | 增大当前放大倍率（按变焦步长递增） |
+| **[obs-auto-zoom] 减小缩放倍数** | `Alt + -` | 减小当前放大倍率（按变焦步长递减） |
+| **[obs-auto-zoom] 在缩放时切换跟随鼠标** | `Alt + F` | 临时切换是否跟随鼠标光标移动 |
+
+### 核心参数说明
+
+| 参数项 | 说明 | 默认值 |
+| :--- | :--- | :--- |
+| **缩放倍数 (Zoom Factor)** | 画面放大的目标倍率（1.0 ~ 5.0） | `2.0` |
+| **缩放速度 (Zoom Speed)** | 镜头放大与缩小的过渡速度 | `0.06` |
+| **缩放动画类型 (Easing)** | 缩放过渡曲线（平滑缓动、线性匀速、减速停靠、电影回弹、瞬间等） | `平滑缓动` |
+| **跟随速度 (Follow Speed)** | 镜头跟随光标平移的速度 | `0.25` |
+| **跟随弹性强度 (Spring Strength)** | 物理阻尼跟随的弹性硬度，设为 0 关闭弹性 | `0.0` |
+| **跟随阻尼比 (Damping Ratio)** | 物理阻尼比，建议范围 `0.5 ~ 0.7` | `0.6` |
+| **空闲自动复原 1x** | 鼠标静止达到设定秒数后自动拉远回 1x 全屏 | `关闭 (3.0s)` |
+| **按键与鼠标可视化** | 实时显示快捷键与鼠标点击，支持居中/边角/跟随光标 | `关闭` |
+| **WebDAV 云端备份** | 支持将当前脚本配置备份到 WebDAV 目录 `obsautozoom` | - |
 
 ---
 
-## ⚙️ 进阶参数调校
+## English
 
-在 OBS 脚本属性窗口中，您可以精细化定制变焦与物理跟随细节：
+A mouse-following zoom script for OBS Studio. Designed for software tutorials, presentations, and livestreaming where smooth camera focus on cursor interactions is needed.
 
-- **缩放动画类型 (Easing)**：
-  - 提供 **平滑缓动**、**线性匀速**、**加速拉近**、**减速停靠**、**电影回弹 (Overshoot)**、**瞬间缩放 (Instant)** 六种预设曲线。
-- **跟随弹性强度 (Spring Strength)**：
-  - 二阶弹簧硬度，滑块范围 `0.0 ~ 50.0`。设置为 `0` 时将自动退化为最稳健的传统平滑跟随。
-- **跟随阻尼比 (Damping Ratio)**：
-  - 回弹阻尼比，默认 `0.6`。值越低回弹越明显，`0.6 ~ 0.7` 是最具舒适电影缓冲感的黄金分割点。
-- **空闲自动复原 1x**：
-  - 勾选此项并设置时间（如 3.0 秒）。当鼠标静止后，镜头会自动拉远还原，防止长时间静止卡在局部放大区影响观众视野。
+### Features
+
+- **Smooth Mouse Tracking**: Uses a spring-damper physics model for natural movement and deceleration. Setting spring strength to 0 falls back to standard smoothing.
+- **Keystroke & Mouse OSD**: Displays keyboard shortcuts and mouse clicks in real time with configurable position presets, pixel offsets, and display durations.
+- **Auto-Reset on Idle**: Smoothly zooms back to 1x full-screen when the mouse cursor remains stationary for a configurable duration.
+- **Step Zooming & Focus Lock**: Supports dynamic zoom adjustment via hotkeys (configurable step size) and viewport lock to keep the camera stationary.
+- **Config Backup & WebDAV Sync**: Export/import settings to local JSON, or sync backups with WebDAV servers (Nextcloud, Synology NAS, ALiST, Jianguoyun, etc.) into the `obsautozoom` folder.
+- **Cross-Platform**: Uses Lua FFI for native cursor tracking across Windows, Linux, and macOS.
+
+### Installation & Quick Start
+
+1. **Download**: Download `obs-auto-zoom.lua` from this repository.
+2. **Load into OBS**: In OBS Studio, open **Tools -> Scripts**, click the **`+`** button, and select `obs-auto-zoom.lua`.
+3. **Select Source**: Under the script properties panel, choose your Display Capture source from the **Zoom Source** dropdown.
+4. **Set Hotkeys**: Navigate to **Settings -> Hotkeys**, filter by `obs-auto-zoom`, and assign your preferred keybindings (e.g., `Alt + Z` for Toggle Zoom).
+
+### Hotkey Reference
+
+Filter by `[obs-auto-zoom]` in OBS **Settings -> Hotkeys**:
+
+| Hotkey Name | Suggested Key | Description |
+| :--- | :--- | :--- |
+| **[obs-auto-zoom] Toggle Zoom To Mouse** | `Alt + Z` | Enables or disables zoom mode |
+| **[obs-auto-zoom] Toggle Lock Focus** | `Alt + L` | Locks the current camera viewport in place |
+| **[obs-auto-zoom] Increase Zoom Factor** | `Alt + =` | Increments zoom magnification by step size |
+| **[obs-auto-zoom] Decrease Zoom Factor** | `Alt + -` | Decrements zoom magnification by step size |
+| **[obs-auto-zoom] Toggle Mouse Follow** | `Alt + F` | Toggles cursor tracking while zoomed |
+
+### Key Settings
+
+| Setting | Description | Default |
+| :--- | :--- | :--- |
+| **Zoom Factor** | Target magnification ratio (1.0 to 5.0) | `2.0` |
+| **Zoom Speed** | Transition speed when zooming in and out | `0.06` |
+| **Zoom Easing Curve** | Transition curve (Ease-In-Out, Linear, Overshoot, Instant, etc.) | `Ease-In-Out` |
+| **Follow Speed** | Pan tracking speed when following mouse cursor | `0.25` |
+| **Spring Strength** | Spring physics hardness for tracking; set to 0 for standard smoothing | `0.0` |
+| **Damping Ratio** | Physical damping ratio (recommended: 0.5 to 0.7) | `0.6` |
+| **Auto-Reset on Idle** | Reverts zoom to 1x after cursor stays idle for specified seconds | `Disabled (3.0s)` |
+| **Keystroke Visualizer** | Displays keystrokes & mouse clicks with customizable positions | `Disabled` |
+| **WebDAV Cloud Backup** | Uploads/downloads settings to/from WebDAV folder `obsautozoom` | - |
 
 ---
 
-## 🤝 贡献与感谢
+## 许可证 / License
 
-- 本项目由 **领创工作室 (LACS Official)** 进行汉化升级与高阶功能重构。
-- 感谢原作者 [BlankSourceCode](https://github.com/BlankSourceCode) 开发了优秀的跨平台 OBS 鼠标跟随缩放逻辑基石。
-- 欢迎提交 Issue 和 Pull Request 一起优化本项目！
-
----
-
-## 📄 开源许可证
-
-本项目基于 [MIT License](LICENSE) 开源许可。
+本项目基于 [MIT License](LICENSE) 开源许可。欢迎提交 Issue 与 Pull Request。 / This project is licensed under the [MIT License](LICENSE). Contributions and issues are welcome.
